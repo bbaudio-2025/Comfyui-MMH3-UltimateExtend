@@ -1,0 +1,73 @@
+{
+  "MMH3SpatialTileEditor": {
+    "display_name": "MMH3 空间分块编辑器",
+    "description": "'MMH3 Spatial Extend Video' 的纯信息分块配置。提供可停靠的编辑器用于排列分块、设置每个分块的提示词与条件模式（每个分块独立选择 FL2VA 或 Ref2VA），并自动计算重叠/渐变值。不加载图像、不输出张量。compose 提供一张整图并由分块方案拆分；每个分块可使用其拆分裁剪区（作为 FL2VA 首/尾帧或 Ref2VA 参考块），或加载自有的图片。JS 前端将每个分块的精确裁剪框以纯数字形式下发（compose_crops）。将 tile_config 连接到 'MMH3 Spatial Extend Video'。",
+    "inputs": {
+      "show_editor": {
+        "name": "显示编辑器",
+        "tooltip": "切换可视化停靠编辑器面板的显示/隐藏。"
+      },
+      "base_prompt": {
+        "name": "基础提示词",
+        "tooltip": "应用于所有分块的共享正向提示词。"
+      },
+      "base_negative": {
+        "name": "基础负向提示词",
+        "tooltip": "应用于所有分块的共享负向提示词。"
+      },
+      "tile_data": {
+        "name": "分块数据",
+        "tooltip": "由停靠编辑器管理的内部 JSON。"
+      }
+    },
+    "outputs": {
+      "0": {
+        "tooltip": "供 'MMH3 Spatial Extend Video' 使用的完整分块配置（纯字典/文本）。"
+      },
+      "1": {
+        "tooltip": "可检查的几何信息摘要：分块数量、布局方案、尺寸，以及每个分块的 compose 裁剪框。"
+      }
+    }
+  },
+  "MMH3SpatialExtendVideo": {
+    "display_name": "MMH3 空间扩展视频",
+    "description": "基于分块的 H3 视频扩展节点：将 tile_config（来自 'MMH3 Spatial Tile Editor'）提供的布局切分为多个分块，逐块采样并拼接成一张更大的视频。每个分块独立地（按 cond_mode）按其参考图像生成首帧/首尾帧（FL2VA）或主体参考块（Ref2VA）；compose 模式下各分块使用其裁剪区。",
+    "inputs": {
+      "tile_config": {
+        "name": "分块配置",
+        "tooltip": "'MMH3 Spatial Tile Editor' 输出的分块配置。"
+      },
+      "fade_mode": {
+        "name": "渐变模式",
+        "tooltip": "控制拼接重叠带 mask 形状：flat（固定整带值）、gradient（空间渐变）、hybrid（混合）。"
+      },
+      "flat_fade_value": {
+        "name": "平面渐变值",
+        "tooltip": "fade_mode 为 'flat' 时整个渐变带的 mask 值。值越低冻结越强（保留更多锚点内容），越高注入更多噪声、生成自由度越高。"
+      },
+      "ref_mode": {
+        "name": "参考模式",
+        "tooltip": "相位 5.5 如何解析相邻参考：use_ref_image 使用前一帧，use_overlap 使用重叠区。"
+      },
+      "overlap_mode": {
+        "name": "重叠归属",
+        "tooltip": "拼接时每一共享重叠带由谁获胜。"
+      },
+      "overlap_blend": {
+        "name": "重叠过渡",
+        "tooltip": "拼接时重叠带如何过渡。"
+      }
+    },
+    "outputs": {
+      "0": {
+        "tooltip": "合并为一个 MiniMax H3 AV 潜变量的各分块。音频通道为分块 0 生成的音频。"
+      },
+      "1": {
+        "tooltip": "分块 0 自身的结果，作为独立的 MiniMax H3 AV 潜变量。"
+      }
+    }
+  },
+  "MMH3LastQuadrantPatch": {
+    "display_name": "MMH3 末象限补丁"
+  }
+}
