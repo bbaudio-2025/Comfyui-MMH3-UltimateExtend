@@ -1,0 +1,15 @@
+# pyproject.toml
+[project]
+name = "Comfyui-MMH3-UltimateExtend"
+description = "Extend MiniMax H3 video in both spatial and temporal dimension"
+version = "0.0.0"
+license = { file = "LICENSE.txt" }
+dependencies  = [] 
+
+[project.urls]
+Repository = "https://github.com/bbaudio-2025/Comfyui-MMH3-UltimateExtend"
+
+[tool.comfy]
+PublisherId = "bbaudio" 
+DisplayName = "Comfyui-MMH3-UltimateExtend" 
+Icon = ""
