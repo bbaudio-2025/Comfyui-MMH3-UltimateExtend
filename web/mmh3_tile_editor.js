@@ -534,7 +534,12 @@ app.registerExtension({
                     const t = node._tiles[i];
                     // Normalize per-tile mode/source (also migrates tiles saved
                     // before per-tile conditioning modes existed).
-                    if (t.cond_mode !== "FL2VA" && t.cond_mode !== "Ref2VA") t.cond_mode = "FL2VA";
+                    if (t.cond_mode !== "FL2VA" && t.cond_mode !== "Ref2VA") {
+                        // Migrate tiles saved while the select stored localized
+                        // display strings ("Ref2VA (reference images)" /
+                        // "Ref2VA（参考图像）" - both start with the token).
+                        t.cond_mode = String(t.cond_mode || "").startsWith("Ref2VA") ? "Ref2VA" : "FL2VA";
+                    }
                     if (t.ref_source !== "crop" && t.ref_source !== "own") {
                         // Tiles that already carry manual refs keep using them;
                         // empty tiles default to their compose split crop.
@@ -1420,7 +1425,11 @@ canvas.addEventListener("pointerup", (e) => {
                 const modeSel = document.createElement("select");
                 modeSel.className = "mmh3te-sel";
                 modeSel.title = uistr("Conditioning mode for this tile: FL2VA = its reference image(s) become the first (and optional last) frame; Ref2VA = they become subject reference blocks. Tiles can mix freely within one plan.");
-                [[uistr("FL2VA (first/last frames)"), "FL2VA (first/last frames)"], [uistr("Ref2VA (reference images)"), "Ref2VA (reference images)"]].forEach(([lab, v]) => {
+                // Option VALUES are the canonical tokens the backend expects;
+                // only the label is localized. (Localized values once made the
+                // selection snap back to FL2VA on re-render and the backend
+                // silently downgrade Ref2VA tiles to FL2VA.)
+                [["FL2VA", uistr("FL2VA (first/last frames)")], ["Ref2VA", uistr("Ref2VA (reference images)")]].forEach(([v, lab]) => {
                     const o = document.createElement("option");
                     o.value = v; o.textContent = lab;
                     if (v === (tile.cond_mode || "FL2VA")) o.selected = true;
