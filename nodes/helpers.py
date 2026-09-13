@@ -6,12 +6,11 @@ conditioning crops and the sampling glue. Kept separate so the Extend Video
 package has no dependency on the upscale/LTX code.
 """
 
-import math
-
 import torch
 
 import comfy.ldm.common_dit
 import comfy.model_management
+import comfy.nested_tensor
 import comfy.sample
 import comfy.samplers
 import comfy.utils
@@ -130,9 +129,22 @@ def build_guider(model, cond, negative, cfg):
     return guider
 
 
-def sample_piece(piece, cond, model, noise, sampler, sigmas, negative, cfg):
+def sample_piece(piece, cond, model, noise, sampler, sigmas, negative, cfg, x0_output=None,
+                 noise_override=None):
     """Sample one tile. Mirrors SamplerCustomAdvanced, including the x0 preview
-    callback. Returns nested samples (video+audio)."""
+    callback. Returns nested samples (video+audio).
+
+    `noise_override` (optional, EXPERIMENTAL - used by the temporal extend
+    node's 'qsample_init' fade implementation) replaces the generated initial
+    noise tensor; `noise` is still consulted for the seed.
+
+    When `x0_output` (a dict) is given, it is filled with "x0_latent": the
+    model's final-step denoised prediction in latent space (SamplerCustom's
+    denoised_output). Unlike the trajectory samples - which at a nonzero
+    sigma still carry that sigma's noise - the x0 prediction's noise-mask
+    frozen zones hold the PRISTINE latent_image content (the mask's per-step
+    output blend pins them there), making it the correct hand-off state for
+    a masked continuation stage."""
     latent = dict(piece)
     latent_image = latent["samples"]
     latent_image = comfy.sample.fix_empty_latent_channels(
@@ -144,15 +156,26 @@ def sample_piece(piece, cond, model, noise, sampler, sigmas, negative, cfg):
     noise_mask = latent.get("noise_mask")
 
     guider = build_guider(model, cond, negative, cfg)
-    x0_output = {}
+    # Use the caller's dict when one was passed (so the caller can read the
+    # final x0 back); only create a local dict when nobody asked for it.
+    if x0_output is None:
+        x0_output = {}
     callback = latent_preview.prepare_callback(guider.model_patcher, sigmas.shape[-1] - 1, x0_output)
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
     samples = guider.sample(
-        noise.generate_noise(latent), latent_image, sampler, sigmas,
+        noise.generate_noise(latent) if noise_override is None else noise_override,
+        latent_image, sampler, sigmas,
         denoise_mask=noise_mask, callback=callback,
         disable_pbar=disable_pbar, seed=noise.seed,
     )
     samples = samples.to(comfy.model_management.intermediate_device())
+    if x0_output is not None and "x0" in x0_output:
+        # mirror SamplerCustom's denoised_output (nodes_custom_sampler.py)
+        x0 = x0_output["x0"]
+        if samples.is_nested and not x0.is_nested:
+            latent_shapes = [x.shape for x in samples.unbind()]
+            x0 = comfy.nested_tensor.NestedTensor(comfy.utils.unpack_latents(x0, latent_shapes))
+        x0_output["x0_latent"] = model.model.process_latent_out(x0.cpu())
     return samples
 
 
