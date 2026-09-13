@@ -24,6 +24,15 @@ from .helpers import (
     sample_piece,
 )
 
+# typed links to the shared sub-node bundles - same socket types the Temporal
+# Extend node uses (io.Custom matches by the string value)
+SAMPLE_PARAMS = io.Custom("MMH3_SAMPLE_PARAMS")
+
+try:
+    from comfy_extras.nodes_custom_sampler import Noise_RandomNoise
+except Exception:  # pragma: no cover - mirrors comfy_extras/nodes_custom_sampler.py
+    from .temporal_extend import Noise_RandomNoise
+
 
 def _edge_fade_mask(th, tw, ol_h, ol_w, fade_h, fade_w,
                     done_top, done_bottom, done_left, done_right,
@@ -252,10 +261,10 @@ def _shrink_freeze_mask(m, shrink_tok, floor_tok=2):
     return keep.to(m.dtype)
 
 
-def _second_pass(model, noise, sampler_2nd, sigmas_2nd, negative, cfg, cond,
+def _second_pass(noise, params_2nd, negative, cond,
                  region, audio, m_static, masked_area_noise, fade_mode="flat",
                  second_pass_mode="unmasked"):
-    """Re-denoise an already-blended tile.
+    """Re-denoise an already-blended tile via the 2nd_sample_params bundle.
 
     second_pass_mode 'unmasked': no noise mask at all - the ENTIRE region
     (overlap bands included) is sampled freely by sigmas_2nd; the blended tile
@@ -276,8 +285,8 @@ def _second_pass(model, noise, sampler_2nd, sigmas_2nd, negative, cfg, cond,
     latent."""
     if second_pass_mode == "unmasked":
         piece = {"samples": comfy.nested_tensor.NestedTensor((region, audio))}
-        return sample_piece(piece, cond, model, noise, sampler_2nd, sigmas_2nd,
-                            negative, cfg).tensors[0]
+        return _run_params(piece, cond, negative, noise, params_2nd,
+                           "2nd pass").tensors[0]
     if second_pass_mode.startswith("shrink_"):
         shrink_px = int(second_pass_mode.split("_")[1])
         m_static = _shrink_freeze_mask(m_static, shrink_px // VAE_DOWNSAMPLE)
@@ -287,23 +296,135 @@ def _second_pass(model, noise, sampler_2nd, sigmas_2nd, negative, cfg, cond,
         "samples": comfy.nested_tensor.NestedTensor((region, audio)),
         "noise_mask": comfy.nested_tensor.NestedTensor((mv, ma)),
     }
-    cleanup = (_register_hybrid_inpaint(model)
+    cleanup = (_register_hybrid_inpaint(params_2nd["model_high"])
                if fade_mode == "hybrid" and bool((m_static < 1.0 - 1e-6).any())
                else None)
     try:
-        out = sample_piece(piece, cond, model, noise, sampler_2nd, sigmas_2nd, negative, cfg)
+        out = _run_params(piece, cond, negative, noise, params_2nd, "2nd pass")
     finally:
         if cleanup is not None:
             cleanup()
     return out.tensors[0]
 
 
-def _merge(model, noise, sampler, sigmas, negative_list, cfg,
+def _run_params(piece, pos, neg, noise, params, tag, bias=None):
+    """Run a SAMPLE_PARAMS bundle (from 'MMH3 Sample Params') on a piece.
+
+    Mirrors the Temporal Extend node's two-stage semantics: the HIGH stage
+    (noise injection, sigma_max -> split sigma) always runs; when the bundle's
+    optional LOW stage is active it continues from the HIGH stage's final x0
+    prediction (SamplerCustom's denoised_output) re-noised to the split sigma
+    with seed + 1. `bias` optionally wraps the HIGH stage's noise generator
+    (qsample_init)."""
+    noise_hi = noise if bias is None else bias(noise)
+    x0 = {} if params["low_active"] else None
+    seg = sample_piece(piece, pos, params["model_high"], noise_hi,
+                       params["sampler_high"], params["sigmas_high"],
+                       neg, params["cfg_high"], x0_output=x0)
+    if not params["low_active"]:
+        return seg
+    sh = params["sigmas_high"]
+    sl = params["sigmas_low"]
+    if not torch.allclose(sh[-1], sl[0]):
+        raise ValueError(
+            "sigma_low's first sigma does not match sigma_high's last sigma "
+            f"({float(sl[0])} vs {float(sh[-1])}) - use SplitSigmas so both "
+            "schedules share the split sigma")
+    x0l = x0.get("x0_latent")
+    if x0l is None:
+        raise ValueError("HIGH stage produced no x0 prediction "
+                         "(empty sigma schedule?)")
+    cont = dict(piece)
+    cont["samples"] = x0l
+    seed = getattr(noise, "seed", None)
+    noise_low = (Noise_RandomNoise((int(seed) + 1) & 0xFFFFFFFFFFFFFFFF)
+                 if seed is not None else noise)
+    print(f"[MMH3SpatialExtendVideo] {tag} LOW stage: HIGH x0 re-noised to "
+          f"sigma {float(sl[0]):.4f}")
+    return sample_piece(cont, pos, params["model_low"], noise_low,
+                        params["sampler_low"], sl, neg, params["cfg_low"])
+
+
+class _InitBiasNoise2D:
+    """EXPERIMENTAL ('qsample_init' fade implementation via 'MMH3 Spatial
+    Fade Params', may be removed).
+
+    Spatial counterpart of the Temporal Extend node's _InitBiasNoise:
+    q_sample-blends the neighbour overlap content into the video stream's
+    initial noise using a per-PIXEL noise-weight map. The content is
+    STANDARDIZED per (channel, spatial token) over the time axis:
+    x_init = m * noise + sqrt(1 - m^2) * (x0 - mu) / sd
+    so the initial state keeps an exactly N(0, 1) marginal - zero mean and
+    unit variance - while carrying the neighbour's structure in its
+    correlations. m = 1 on free pixels, 0 on frozen ones. Deliberately dumb:
+    wraps the real noise generator and restores plain noise on any surprise."""
+
+    def __init__(self, inner, profile_hw, x0_video, content_sign=1.0):
+        self.inner = inner
+        # sample_piece reads noise.seed for its progress bar - mirror
+        # the Temporal node's _InitBiasNoise and forward the real seed.
+        self.seed = getattr(inner, "seed", 0)
+        self.profile = profile_hw        # [H, W] noise-weight map (1 = pure noise)
+        self.x0_video = x0_video         # [1, C, T, H, W] tile latent
+        # negative init_content_weight: flip the content term's sign only
+        # (anti-correlated experiment); 0 keeps the plain continuation.
+        self.content_sign = -1.0 if content_sign < 0 else 1.0
+
+    def generate_noise(self, latent):
+        n = self.inner.generate_noise(latent)
+        try:
+            if not (n.is_nested and self.x0_video is not None):
+                return n
+            v, a = n.unbind()
+            v = v.clone()
+            x0 = self.x0_video.to(device=v.device, dtype=v.dtype)
+            h, w = self.profile.shape
+            m = self.profile.to(device=v.device, dtype=v.dtype).view(1, 1, 1, h, w)
+            # standardize per (channel, spatial token) over the time axis
+            mu = x0.mean(dim=2, keepdim=True)
+            sd = x0.std(dim=2, keepdim=True).clamp_min(1e-6)
+            x0n = (x0 - mu) / sd
+            mb2 = (1.0 - m * m).clamp_min(0.0).sqrt()
+            blend = m * v + (self.content_sign * mb2) * x0n
+            v = torch.where(m > 0, blend, x0)
+            return comfy.nested_tensor.NestedTensor((v, a))
+        except Exception as exc:
+            print(f"[MMH3SpatialExtendVideo] WARNING: qsample_init noise bias "
+                  f"failed ({exc}); falling back to plain noise")
+            return n
+
+
+def _qsample_prep(m_raw, weight):
+    """Build the (binary mask, initial-noise weight map) pair for
+    fade_impl='qsample_init' from the baked soft overlap/fade mask.
+
+    m_raw: [H, W] soft mask (0 = frozen, fade band in (0, 1), 1 = free).
+    Returns:
+      * m_bin   - strictly binary sampling mask: frozen 0, everything else 1,
+        so the fade band never sees intermediate timesteps (the H3
+        intermediate-mask regime that produces mosaic-like content);
+      * m_noise - per-pixel INITIAL-NOISE weight map: 1 on free pixels,
+        sqrt(1 - (w*c)^2) on band pixels, 0 on frozen pixels, where
+        c = 1 - m_raw is the content weight (strong toward the frozen side,
+        decaying toward the tile interior) capped by |weight|;
+      * sign    - the sign of `weight` (init_content_weight): negative
+        values flip the content term's sign in _InitBiasNoise2D
+        (anti-correlated experiment); the noise map depends on w^2 only."""
+    c = (1.0 - m_raw).clamp_min(0.0) * (m_raw > 0).to(m_raw.dtype)
+    w = min(max(float(weight), -1.0), 1.0)
+    aw = abs(w)
+    m_noise = torch.sqrt((1.0 - (aw * c) ** 2).clamp_min(0.0))
+    m_noise = torch.where(m_raw > 0, m_noise, torch.zeros_like(m_noise))
+    m_bin = (m_raw > 0).to(m_raw.dtype)
+    return m_bin, m_noise, (-1.0 if w < 0 else 1.0)
+
+
+def _merge(sample_params, noise, negative_list,
            audio, tconds, latents, plan,
            ol_ws, ol_hs, fws, fhs, overlap_mode, overlap_blend, inpaint=None,
            skip_first=False, masked_area_noise=0.0,
            fade_mode="flat", fade_val=0.5,
-           sampler_2nd=None, sigmas_2nd=None, second_pass_mode="unmasked"):
+           params_2nd=None, fade_params=None, second_pass_mode="unmasked"):
     """Sample every tile and stitch them into one AV latent per a tile_plan.
 
     `tconds` / `negative_list` / `latents` are lists aligned to plan placements
@@ -343,13 +464,16 @@ def _merge(model, noise, sampler, sigmas, negative_list, cfg,
     once). Returns (acc_video, out_audio, tiles_info, t0) where t0 is tile 0's
     raw sample_piece output (None when the anchor came from skip_first)."""
     _, cp, T, _, _ = latents[0].tensors[0].shape
+    model = sample_params["model_high"]
+    sigmas = sample_params["sigmas_high"]
     sampling = getattr(model, "model_sampling", None)
     axis = plan["axis"]
     n = len(tconds)
-    # Second pass runs on blocks from the 2nd on; disabled when sampler_2nd or a
-    # usable sigmas_2nd (>= 1 step) is missing.
-    second_on = (sampler_2nd is not None and sigmas_2nd is not None
-                 and sigmas_2nd.shape[-1] > 1)
+    # Second pass runs on blocks from the 2nd on; disabled when params_2nd or a
+    # usable sigma schedule (>= 1 step) is missing.
+    second_on = (params_2nd is not None
+                 and int(params_2nd["sigmas_high"].shape[-1]) > 1)
+    qsample = bool(fade_params and fade_params.get("fade_impl") == "qsample_init")
 
     heights = [l.tensors[0].shape[3] for l in latents]
     widths = [l.tensors[0].shape[4] for l in latents]
@@ -421,7 +545,17 @@ def _merge(model, noise, sampler, sigmas, negative_list, cfg,
         m = _edge_fade_mask(th_i, tw_i, oH, oW, fH, fW,
                             done_top, done_bottom, done_left, done_right,
                             flat_val=(fade_val if fade_mode == "flat" else None))
-        m_v = m + masked_area_noise * (1.0 - m)
+        if qsample:
+            # EXPERIMENTAL 'qsample_init': strictly binary sampling mask (the
+            # fade band never sees intermediate timesteps) + the soft content
+            # profile rides into the INITIAL NOISE via _InitBiasNoise2D.
+            m_bin, m_noise, csign = _qsample_prep(m, fade_params.get(
+                "init_content_weight", 1.0))
+            print(f"[MMH3SpatialExtendVideo] tile {i} fade_impl=qsample_init: "
+                  "fade band biased into the initial noise (binary mask)")
+        else:
+            m_bin, m_noise, csign = m, None, 1.0
+        m_v = m_bin + masked_area_noise * (1.0 - m_bin)
         mv = m_v[None, None, None]
         tatk = audio.shape[-1]
         ma = (torch.ones if i == 0 else torch.zeros)(
@@ -449,10 +583,15 @@ def _merge(model, noise, sampler, sigmas, negative_list, cfg,
             cond = apply_control(cond, c_net)
 
         cleanup = (_register_hybrid_inpaint(model)
-                   if fade_mode == "hybrid" and bool((m < 1.0 - 1e-6).any())
+                   if (not qsample and fade_mode == "hybrid"
+                       and bool((m < 1.0 - 1e-6).any()))
                    else None)
         try:
-            out = sample_piece(piece, cond, model, noise, sampler, sigmas, negative, cfg)
+            bias = None
+            if qsample and m_noise is not None and bool((m_noise < 1.0).any()):
+                bias = (lambda nz: _InitBiasNoise2D(nz, m_noise, tile, csign))
+            out = _run_params(piece, cond, negative, noise, sample_params,
+                              f"tile {i}", bias=bias)
         finally:
             if cleanup is not None:
                 cleanup()
@@ -493,10 +632,11 @@ def _merge(model, noise, sampler, sigmas, negative_list, cfg,
             band[:, :, :, th_i - oH:, :] = True
         region = torch.where(band, region, tile_v)
         # EXPERIMENTAL second pass: after the overlap blend, re-denoise this
-        # block (from the 2nd on) with sampler_2nd/sigmas_2nd.
+        # block (from the 2nd on) with the 2nd_sample_params bundle.
         if second_on and i > 0:
-            region = _second_pass(model, noise, sampler_2nd, sigmas_2nd, negative,
-                                  cfg, cond, region, out.tensors[1], m,
+            region = _second_pass(noise, params_2nd, negative,
+                                  cond, region, out.tensors[1],
+                                  (m_bin if qsample else m),
                                   masked_area_noise, fade_mode, second_pass_mode)
         acc[:, :, :, ro:ro + th_i, co:co + tw_i] = region
 
@@ -508,6 +648,7 @@ def _merge(model, noise, sampler, sigmas, negative_list, cfg,
             "done_left": done_left, "done_right": done_right,
             "overlap_w": oW, "overlap_h": oH, "fade_w": fW, "fade_h": fH,
             "overlap_mode": overlap_mode, "overlap_blend": overlap_blend,
+            "fade_impl": "qsample_init" if qsample else "mask",
             "skipped": False,
         })
     return acc, out_a, tiles_info, t0
@@ -640,13 +781,13 @@ def _tile_mask_from_rects(rects, hi, wi, fW, fH, fade_val=0.5,
     return m
 
 
-def _merge_2d(model, noise, sampler, sigmas, negative_list, cfg,
+def _merge_2d(sample_params, noise, negative_list,
               audio, tconds, latents, plan,
               ol_ws, ol_hs, fws, fhs, overlap_mode, overlap_blend, inpaint=None,
               skip_first=False, masked_area_noise=0.0,
               bug_patch=None,
               fade_mode="flat", fade_val=0.5,
-              sampler_2nd=None, sigmas_2nd=None, second_pass_mode="unmasked"):
+              params_2nd=None, fade_params=None, second_pass_mode="unmasked"):
     """Sample the 5 tiles of '4_quadrants_expand' and stitch them into one AV
     latent. Tile 0 is the center anchor; tiles 1..4 are sampled around it and
     blended over the rectangles where they overlap already-placed content (the
@@ -660,9 +801,12 @@ def _merge_2d(model, noise, sampler, sigmas, negative_list, cfg,
     origins = _quadrant_placements(sizes, ol_ws, ol_hs)
     n = len(tconds)
     _, cp, T, _, _ = latents[0].tensors[0].shape
-    second_on = (sampler_2nd is not None and sigmas_2nd is not None
-                 and sigmas_2nd.shape[-1] > 1)
+    second_on = (params_2nd is not None
+                 and int(params_2nd["sigmas_high"].shape[-1]) > 1)
+    model = sample_params["model_high"]
+    sigmas = sample_params["sigmas_high"]
     sampling = getattr(model, "model_sampling", None)
+    qsample = bool(fade_params and fade_params.get("fade_impl") == "qsample_init")
     top = origins[1][0]
     left = origins[1][1]
     acc_h = (origins[4][0] + sizes[4][0]) - top
@@ -807,7 +951,18 @@ def _merge_2d(model, noise, sampler, sigmas, negative_list, cfg,
                                               frozenW=efz, frozenH=efz,
                                               smooth=True).to(acc.dtype))
 
-        m_v = m + masked_area_noise * (1.0 - m)
+        if qsample:
+            # EXPERIMENTAL 'qsample_init': binary mask + content profile in
+            # the initial noise (see _qsample_prep). The wt stitch blend is
+            # unaffected - it is a pure post-sampling latent operation.
+            m_bin, m_noise, csign = _qsample_prep(m, fade_params.get(
+                "init_content_weight", 1.0))
+            print(f"[MMH3SpatialExtendVideo] quadrant tile {i} "
+                  "fade_impl=qsample_init: fade band biased into the "
+                  "initial noise (binary mask)")
+        else:
+            m_bin, m_noise, csign = m, None, 1.0
+        m_v = m_bin + masked_area_noise * (1.0 - m_bin)
         mv = m_v[None, None, None]
         tatk = audio.shape[-1]
         ma = (torch.ones if i == 0 else torch.zeros)(
@@ -839,10 +994,15 @@ def _merge_2d(model, noise, sampler, sigmas, negative_list, cfg,
             out_a = latents[0].tensors[1]
         else:
             cleanup = (_register_hybrid_inpaint(model)
-                       if fade_mode == "hybrid" and bool((m < 1.0 - 1e-6).any())
+                       if (not qsample and fade_mode == "hybrid"
+                           and bool((m < 1.0 - 1e-6).any()))
                        else None)
             try:
-                out = sample_piece(piece, cond, model, noise, sampler, sigmas, negative, cfg)
+                bias = None
+                if qsample and m_noise is not None and bool((m_noise < 1.0).any()):
+                    bias = (lambda nz: _InitBiasNoise2D(nz, m_noise, tile, csign))
+                out = _run_params(piece, cond, negative, noise, sample_params,
+                                  f"quadrant tile {i}", bias=bias)
             finally:
                 if cleanup is not None:
                     cleanup()
@@ -854,10 +1014,11 @@ def _merge_2d(model, noise, sampler, sigmas, negative_list, cfg,
             wt4 = wt[None, None, None]
             region = tile * (1.0 - wt4) + tile_v * wt4
             # EXPERIMENTAL second pass: after the overlap blend, re-denoise this
-            # block (from the 2nd on) with sampler_2nd/sigmas_2nd.
+            # block (from the 2nd on) with the 2nd_sample_params bundle.
             if second_on and i > 0:
-                region = _second_pass(model, noise, sampler_2nd, sigmas_2nd, negative,
-                                      cfg, cond, region, out.tensors[1], m,
+                region = _second_pass(noise, params_2nd, negative,
+                                      cond, region, out.tensors[1],
+                                      (m_bin if qsample else m),
                                       masked_area_noise, fade_mode, second_pass_mode)
             acc[:, :, :, at:at + hi, ac:ac + wi] = region
 
@@ -869,6 +1030,7 @@ def _merge_2d(model, noise, sampler, sigmas, negative_list, cfg,
             "overlap_w": oW, "overlap_h": oH, "fade_w": fW, "fade_h": fH,
             "overlap_mode": overlap_mode, "overlap_blend": overlap_blend,
             "fade_mode": fade_mode, "fade_val": fade_val,
+            "fade_impl": "qsample_init" if qsample else "mask",
             "skipped": bool(skip_first and i == 0),
         })
         prior.append(((ro, co, ro + hi, co + wi), i))
@@ -1131,47 +1293,46 @@ class MMH3SpatialExtendVideo(io.ComfyNode):
             category="model/latent/minimax",
             description=(
                 "Generate MiniMax H3 AV tiles from a 'MMH3 Spatial Tile Editor' config "
-                "and merge them into one latent. Connect tile_config + clip + vae; "
+                "and merge them into one latent. Connect tile_config + sample_params + clip + vae; "
                 "conditioning is created internally from prompts and reference images."
             ),
             search_aliases=["h3 extend", "h3 expand", "h3 outpaint", "h3 tile", "h3 merge"],
             inputs=[
-                io.Model.Input("model", tooltip="The diffusion model used to sample every tile."),
-                io.Dict.Input("tile_config",
-                    tooltip="Output of 'MMH3 Spatial Tile Editor'. Provides per-tile prompts, reference images, dimensions, overlap/fade, and layout scheme."),
                 io.Clip.Input("clip",
                     tooltip="MiniMax H3 CLIP model for encoding prompts and reference images."),
                 io.Vae.Input("vae",
                     tooltip="MiniMax H3 Video VAE for encoding reference images."),
                 io.Noise.Input("noise", tooltip="Noise source; one noise tensor is generated per tile."),
-                io.Sampler.Input("sampler", tooltip="Sampler used for every tile."),
-                io.Sigmas.Input("sigmas", tooltip="Sigma schedule used for every tile."),
-                io.Sampler.Input("sampler_2nd", optional=True,
-                    tooltip="EXPERIMENTAL. Sampler for a second refinement pass run on each block (from the 2nd block on) after its first pass and overlap blend. Leave unconnected to disable the second pass."),
-                io.Sigmas.Input("sigmas_2nd", optional=True,
-                    tooltip="EXPERIMENTAL. Sigma schedule for the second pass; supply its own scheduler/steps/denoise (e.g. a BasicScheduler). The second pass is skipped when this is unconnected, empty, or has fewer than one step (denoise 0 / steps 0)."),
-                io.Float.Input("cfg", default=1.0, min=0.0, max=100.0, step=0.1, round=0.01, tooltip="CFG scale used for tiles whose negative is connected."),
-                # H3_INPAINT_PARAM.Input("inpaint_param", optional=True, tooltip="Output of 'MMH3 Spatial Inpaint Params'. When connected, each tile's overlap strips are pinned to its already-sampled neighbour, removing visible seams. Leave unconnected to disable."),
-                io.Latent.Input("latent_tile_0", optional=True,
-                    tooltip="Existing anchor video latent. When connected, the first tile is NOT sampled - its video/audio are taken straight from this latent as an already-generated anchor and the remaining tiles are extended around it. When unconnected, tile 0 (and all tiles) are sampled normally."),
+                io.Dict.Input("tile_config",
+                    tooltip="Output of 'MMH3 Spatial Tile Editor'. Provides per-tile prompts, reference images, dimensions, overlap/fade, and layout scheme."),
+                SAMPLE_PARAMS.Input("sample_params",
+                    tooltip="Sampling parameters from the 'MMH3 Sample Params' sub-node: a HIGH stage (noise injection) plus an optional LOW stage (no noise). Used for every tile's first pass."),
                 io.Int.Input("length", default=124, min=5, max=3600, step=17,
                              tooltip="Frame count at 24 fps (124 = ~5s, trained range ~124-362). Must be 17*n+5. Overridden by latent_tile_0 frame count when it is connected."),
                 io.Combo.Input("ref_image_size", options=["match", "max"], default="match",
                                tooltip="Reference image sizing. 'match' scales each ref to the generation's pixel area; 'max' uses 2048px short edge for best identity fidelity. Only used in Ref2VA mode; ignored in FL2VA."),
                 io.Float.Input("masked_area_noise", default=0.0, min=0.0, max=1.0, step=0.01, round=0.01,
                                tooltip="TEST PARAM. Raises every mask value toward 1 (label, input mix and output blend together): 0 (default) keeps the frozen/fade bands as configured; 1.0 disables the mask entirely and every tile is sampled freely."),
-                io.Dict.Input("bug_patch", optional=True,
-                              tooltip="Layout-specific special handling. Currently: output of 'MMH3 Last Quadrant Patch' (4_quadrants_expand only) replaces the noise mask of any tile enabled on that node (four per-tile toggles) with explicit center-seam/edge-seam frozen+fade widths. Ignored (console note) on other layouts. Leave unconnected for default behavior."),
+                io.Combo.Input("fade_impl", options=["mask", "qsample_init"], default="mask",
+                               tooltip="EXPERIMENTAL. Fade implementation: 'mask' = the default soft noise-mask band (intermediate per-token timesteps; known to produce mosaic-like artifacts on H3). 'qsample_init' = keeps the band at full-strength timesteps and steers the transition by q_sample-blending the neighbour overlap content into the INITIAL NOISE, decaying from the frozen side toward the tile interior. Advantage over 'mask': the band never sees intermediate timesteps, so seams are far more likely to continue cleanly, at zero extra cost. SAMPLER NOTE: only works properly with stochastic SDE-type samplers that re-inject fresh noise every step (sa_solver, er_sde, dpmpp_2m_sde, dpmpp_3m_sde, ...); deterministic ODE samplers (euler, res_multistep, uni_pc, dpmpp_2m, ...) develop brightness/saturation drift in the band."),
+                io.Float.Input("init_content_weight", default=1.0, min=-1.0, max=1.0, step=0.05,
+                               tooltip="EXPERIMENTAL, only effective with fade_impl='qsample_init'. Caps how much neighbour STRUCTURE rides in the initial noise (1.0 = full structure; 0 = pure noise). The structured init at t=sigma_max is out-of-distribution and the model may over-develop it (brightness/saturation drift). On a compatible stochastic sampler (er_sde / sa_solver / dpmpp_2m_sde / dpmpp_3m_sde) even 1.0 tends to stay clean; on deterministic ODE samplers the drift shows up regardless of this value. NEGATIVE values (experiment): the band carries SIGN-FLIPPED, anti-correlated neighbour structure. This is NOT 'more different from the neighbour' (0 already is maximal independence) - the start stays pinned to the reference, just inverted; expect mirrored/inverted development or nothing at all."),
                 io.Combo.Input("fade_mode", options=["flat", "gradient", "hybrid"], default="flat",
                                tooltip="How the fade band's noise mask is shaped. The H3 invariant is per-token label-input consistency: the mask value becomes each 2x2-pooled token's timestep label AND mixes that token's input (m*noise+(1-m)*anchor = anchor noised to level m*sigma). 'flat': constant flat_fade_value band - consistent at every level, empirically the most stable. 'gradient': legacy 0->1 ramp - consistent per pixel, mild mismatch at the 2x2 patch pooling (label takes the patch max); empirically close to flat. 'hybrid': same labels as 'gradient', but during sampling the masked-input mix is patched - each masked pixel's input becomes full-strength anchor + pool(m)*sigma*noise (the stock mix scales the anchor to (1-m) brightness, an out-of-distribution half-brightness signal that likely reads as the fade band's residual grain; H3's reference tokens use the full-strength construction). Experimental - A/B against 'gradient' to isolate the input-mix effect."),
                 io.Float.Input("flat_fade_value", default=0.5, min=0.0, max=1.0, step=0.01,
-                               tooltip="Mask value of the whole fade band (fade_mode 'flat'). LOWER = stronger freeze, more neighbour content preserved; HIGHER = more noise injected, freer generation. 0 = fully frozen band, 0.5 = half-preserved (recommended), 1 = mask off. Ignored in 'gradient' mode."),
+                               tooltip="Mask value of the whole fade band (fade_mode 'flat'). LOWER = stronger freeze, more neighbour content preserved; HIGHER = more noise injected, freer generation. 0 = fully frozen band, 0.5 = half-preserved (recommended), 1 = mask off. Ignored in 'gradient' mode. When fade_impl='qsample_init' is selected, this value only shapes the INITIAL-NOISE content profile, not the sampling mask."),
                 io.Combo.Input("ref_mode", options=["use_ref_image", "use_overlap"], default="use_ref_image",
                                tooltip="What extension tiles (tiles 1..N) condition on. The two modes are mutually exclusive. 'use_ref_image': each tile uses its own reference source from the Tile Editor under that tile's own cond_mode (FL2VA: first/last keyframes; Ref2VA: reference blocks; modes can mix per tile) - the standard behaviour. 'use_overlap': tile 0 is finalized FIRST (freely sampled, or taken from latent_tile_0 when that anchor is connected), then each extension tile's reference images are IGNORED and replaced by the part of tile 0 its frozen band covers, injected as a leading Ref2VA reference block (<Picture 1>): in serpentine layouts a single full-length edge strip; in 4_quadrants the single corner rect the tile shares with the center (full-length edge strips there would leak the neighbouring quadrants' overlap zones into the reference). The strip's frame-0 latent is sliced directly from tile 0's latent (no VAE round-trip; the Qwen3-VL vision stream sees a neutral gray placeholder). Anchors only the seam, so the rest generates freely. Strips always come from tile 0 (the only tile that exists when extension conditionings are baked); in 4+ tile serpentine layouts the bands of tiles 3+ abut tiles 1/2 instead, so their strips carry tile 0's corresponding edge as scene context rather than the exact seam. A tile with zero overlap gets no strip reference. Total sampling work is unchanged."),
                 io.Combo.Input("overlap_mode", options=["earlier", "later"], default="earlier", tooltip="Who wins each shared overlap band when stitching."),
                 io.Combo.Input("overlap_blend", options=["linear", "smoothstep", "overwrite", "midpoint"], default="linear", tooltip="How the overlap band transitions when stitching."),
                 io.Combo.Input("second_pass_mode", options=["unmasked", "tile_mask", "shrink_32_no_fade", "shrink_64_no_fade"], default="unmasked",
                                tooltip="Second-pass masking (needs sampler_2nd/sigmas_2nd connected). 'unmasked': no noise mask - the ENTIRE tile region (overlap bands included) is sampled freely by sigmas_2nd; the blended tile latent is the starting point, so a full-strength schedule regenerates the tile while a low-denoise schedule refines it globally. 'tile_mask': the tile's baked overlap/fade mask is reused - the frozen band keeps the stitched content and only the feathered/free band is re-denoised. 'shrink_32_no_fade' / 'shrink_64_no_fade': SECOND-PASS-ONLY mask variants - each seam's frozen band is shrunk by 32/64 px toward the seam and the fade band is dropped (hard frozen/free cut, no mid-value tokens), so the released strip plus the former fade band are re-denoised from the blended latent while a reduced frozen anchor stays glued to the seam. Narrow bands (e.g. the edge overlaps of 4_quadrants) keep at least 32 px of freeze (or their full width when narrower). Audio stays frozen as in 'tile_mask'."),
+                SAMPLE_PARAMS.Input("2nd_sample_params", optional=True,
+                    tooltip="EXPERIMENTAL. Sampling parameters for a second refinement pass run on each block (from the 2nd block on) after its first pass and overlap blend; its HIGH stage drives the pass and its optional LOW stage continues it. Leave unconnected to disable the second pass."),
+                io.Latent.Input("latent_tile_0", optional=True,
+                    tooltip="Existing anchor video latent. When connected, the first tile is NOT sampled - its video/audio are taken straight from this latent as an already-generated anchor and the remaining tiles are extended around it. When unconnected, tile 0 (and all tiles) are sampled normally."),
+                io.Dict.Input("bug_patch", optional=True,
+                              tooltip="Layout-specific special handling. Currently: output of 'MMH3 Last Quadrant Patch' (4_quadrants_expand only) replaces the noise mask of any tile enabled on that node (four per-tile toggles) with explicit center-seam/edge-seam frozen+fade widths. Ignored (console note) on other layouts. Leave unconnected for default behavior."),
             ],
             outputs=[
                 io.Latent.Output("latent", tooltip="The tiles merged into one MiniMax H3 AV latent. The audio channel is tile 0's generated audio."),
@@ -1180,20 +1341,23 @@ class MMH3SpatialExtendVideo(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, tile_config, clip, vae,
-                noise, sampler, sigmas, cfg=1.0,
-                sampler_2nd=None, sigmas_2nd=None,
+    def execute(cls, tile_config, sample_params, clip, vae,
+                noise,
                 latent_tile_0=None,
                 length=124, ref_image_size="match", masked_area_noise=0.0,
                 bug_patch=None,
-                fade_mode="flat", flat_fade_value=0.5, ref_mode="use_ref_image",
+                fade_mode="flat", flat_fade_value=0.5,
+                fade_impl="mask", init_content_weight=1.0,
+                ref_mode="use_ref_image",
                 overlap_mode="earlier", overlap_blend="linear",
-                second_pass_mode="unmasked") -> io.NodeOutput:
+                second_pass_mode="unmasked", **kwargs) -> io.NodeOutput:
+        # The socket is named '2nd_sample_params' (not a valid Python
+        # identifier), so ComfyUI passes it through **kwargs.
+        second_sample_params = kwargs.get("2nd_sample_params")
         return cls._execute_from_config(
-            model, tile_config, clip, vae,
-            noise, sampler, sigmas, cfg,
-            sampler_2nd=sampler_2nd,
-            sigmas_2nd=sigmas_2nd,
+            tile_config, sample_params, clip, vae,
+            noise,
+            second_sample_params=second_sample_params,
             second_pass_mode=second_pass_mode,
             latent_tile_0=latent_tile_0,
             length=length,
@@ -1202,6 +1366,8 @@ class MMH3SpatialExtendVideo(io.ComfyNode):
             bug_patch=bug_patch,
             fade_mode=fade_mode,
             flat_fade_value=flat_fade_value,
+            fade_impl=fade_impl,
+            init_content_weight=init_content_weight,
             ref_mode=ref_mode,
             overlap_mode=overlap_mode, overlap_blend=overlap_blend,
         )
@@ -1209,8 +1375,8 @@ class MMH3SpatialExtendVideo(io.ComfyNode):
     # ── tile_config path: create per-tile conditionings from config dict ──
 
     @classmethod
-    def _execute_from_config(cls, model, tile_config, clip, vae,
-                             noise, sampler, sigmas, cfg, **kwargs):
+    def _execute_from_config(cls, tile_config, sample_params, clip, vae,
+                             noise, **kwargs):
         """Create per-tile conditionings from tile_config and run tiling.
 
         Conditioning is pre-generated for all tiles before sampling begins,
@@ -1421,7 +1587,7 @@ class MMH3SpatialExtendVideo(io.ComfyNode):
                 print("[MMH3SpatialExtendVideo] use_overlap: sampling tile 0 first so "
                       "its content can anchor the extensions")
                 anchor_out = _sample_anchor_tile(
-                    model, noise, sampler, sigmas, negatives[0], cfg,
+                    sample_params, noise, negatives[0],
                     positives[0], latents[0]["samples"],
                     masked_area_noise=kwargs.get("masked_area_noise", 0.0))
                 latents[0] = {"samples": anchor_out}
@@ -1522,7 +1688,7 @@ class MMH3SpatialExtendVideo(io.ComfyNode):
 
         if scheme == "4_quadrants_expand":
             out_v, out_a, tiles_info, t0 = _merge_2d(
-                model, noise, sampler, sigmas, negative_list, cfg,
+                sample_params, noise, negative_list,
                 audio_src, tconds, video_list, tile_plan,
                 ol_ws, ol_hs, fws, fhs,
                 overlap_mode, overlap_blend,
@@ -1531,13 +1697,14 @@ class MMH3SpatialExtendVideo(io.ComfyNode):
                 bug_patch=bug_patch,
                 fade_mode=kwargs.get("fade_mode", "flat"),
                 fade_val=kwargs.get("flat_fade_value", 0.5),
-                sampler_2nd=kwargs.get("sampler_2nd"),
-                sigmas_2nd=kwargs.get("sigmas_2nd"),
+                params_2nd=kwargs.get("second_sample_params"),
+                fade_params={"fade_impl": kwargs.get("fade_impl", "mask"),
+                             "init_content_weight": float(kwargs.get("init_content_weight", 1.0))},
                 second_pass_mode=kwargs.get("second_pass_mode", "unmasked"),
             )
         else:
             out_v, out_a, tiles_info, t0 = _merge(
-                model, noise, sampler, sigmas, negative_list, cfg,
+                sample_params, noise, negative_list,
                 audio_src, tconds, video_list, tile_plan,
                 ol_ws, ol_hs, fws, fhs,
                 overlap_mode, overlap_blend,
@@ -1545,8 +1712,9 @@ class MMH3SpatialExtendVideo(io.ComfyNode):
                 masked_area_noise=kwargs.get("masked_area_noise", 0.0),
                 fade_mode=kwargs.get("fade_mode", "flat"),
                 fade_val=kwargs.get("flat_fade_value", 0.5),
-                sampler_2nd=kwargs.get("sampler_2nd"),
-                sigmas_2nd=kwargs.get("sigmas_2nd"),
+                params_2nd=kwargs.get("second_sample_params"),
+                fade_params={"fade_impl": kwargs.get("fade_impl", "mask"),
+                             "init_content_weight": float(kwargs.get("init_content_weight", 1.0))},
                 second_pass_mode=kwargs.get("second_pass_mode", "unmasked"),
             )
 
@@ -1697,7 +1865,7 @@ def _tile0_ref_regions(scheme, axis, i, anchor_video, ol_ws, ol_hs):
              z[:, :, :1].contiguous())]
 
 
-def _sample_anchor_tile(model, noise, sampler, sigmas, negative, cfg, cond,
+def _sample_anchor_tile(sample_params, noise, negative, cond,
                         samples, masked_area_noise=0.0):
     """Freely sample tile 0 alone, mirroring _merge's i==0 piece exactly.
 
@@ -1715,7 +1883,8 @@ def _sample_anchor_tile(model, noise, sampler, sigmas, negative, cfg, cond,
         "samples": samples,
         "noise_mask": comfy.nested_tensor.NestedTensor((mv, ma)),
     }
-    return sample_piece(piece, cond, model, noise, sampler, sigmas, negative, cfg)
+    return _run_params(piece, cond, negative, noise, sample_params,
+                       "anchor tile")
 
 
 def _create_conditioning(clip, vae, prompt, w, h, frame_count, ref_images,
