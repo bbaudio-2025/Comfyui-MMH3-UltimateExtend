@@ -2,7 +2,7 @@
 [project]
 name = "Comfyui-MMH3-UltimateExtend"
 description = "Extend MiniMax H3 video in both spatial and temporal dimension"
-version = "0.0.1"
+version = "0.0.2"
 license = { file = "LICENSE.txt" }
 dependencies  = [] 
 
