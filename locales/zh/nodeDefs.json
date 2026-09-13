@@ -1,73 +1,311 @@
 {
-  "MMH3SpatialTileEditor": {
-    "display_name": "MMH3 空间分块编辑器",
-    "description": "'MMH3 Spatial Extend Video' 的纯信息分块配置。提供可停靠的编辑器用于排列分块、设置每个分块的提示词与条件模式（每个分块独立选择 FL2VA 或 Ref2VA），并自动计算重叠/渐变值。不加载图像、不输出张量。compose 提供一张整图并由分块方案拆分；每个分块可使用其拆分裁剪区（作为 FL2VA 首/尾帧或 Ref2VA 参考块），或加载自有的图片。JS 前端将每个分块的精确裁剪框以纯数字形式下发（compose_crops）。将 tile_config 连接到 'MMH3 Spatial Extend Video'。",
-    "inputs": {
-      "show_editor": {
-        "name": "显示编辑器",
-        "tooltip": "切换可视化停靠编辑器面板的显示/隐藏。"
-      },
-      "base_prompt": {
-        "name": "基础提示词",
-        "tooltip": "应用于所有分块的共享正向提示词。"
-      },
-      "base_negative": {
-        "name": "基础负向提示词",
-        "tooltip": "应用于所有分块的共享负向提示词。"
-      },
-      "tile_data": {
-        "name": "分块数据",
-        "tooltip": "由停靠编辑器管理的内部 JSON。"
-      }
-    },
-    "outputs": {
-      "0": {
-        "tooltip": "供 'MMH3 Spatial Extend Video' 使用的完整分块配置（纯字典/文本）。"
-      },
-      "1": {
-        "tooltip": "可检查的几何信息摘要：分块数量、布局方案、尺寸，以及每个分块的 compose 裁剪框。"
-      }
-    }
+ "MMH3SpatialTileEditor": {
+  "display_name": "MMH3 空间分块编辑器",
+  "description": "'MMH3 Spatial Extend Video' 的纯信息分块配置。提供可停靠的编辑器用于排列分块、设置每个分块的提示词与条件模式（每个分块独立选择 FL2VA 或 Ref2VA），并自动计算重叠/渐变值。不加载图像、不输出张量。compose 提供一张整图并由分块方案拆分；每个分块可使用其拆分裁剪区（作为 FL2VA 首/尾帧或 Ref2VA 参考块），或加载自有的图片。JS 前端将每个分块的精确裁剪框以纯数字形式下发（compose_crops）。将 tile_config 连接到 'MMH3 Spatial Extend Video'。",
+  "inputs": {
+   "show_editor": {
+    "name": "显示编辑器",
+    "tooltip": "切换可视化停靠编辑器面板的显示/隐藏。"
+   },
+   "base_prompt": {
+    "name": "基础提示词",
+    "tooltip": "应用于所有分块的共享正向提示词。"
+   },
+   "base_negative": {
+    "name": "基础负向提示词",
+    "tooltip": "应用于所有分块的共享负向提示词。"
+   },
+   "tile_data": {
+    "name": "分块数据",
+    "tooltip": "由停靠编辑器管理的内部 JSON。"
+   }
   },
-  "MMH3SpatialExtendVideo": {
-    "display_name": "MMH3 空间扩展视频",
-    "description": "基于分块的 H3 视频扩展节点：将 tile_config（来自 'MMH3 Spatial Tile Editor'）提供的布局切分为多个分块，逐块采样并拼接成一张更大的视频。每个分块独立地（按 cond_mode）按其参考图像生成首帧/首尾帧（FL2VA）或主体参考块（Ref2VA）；compose 模式下各分块使用其裁剪区。",
-    "inputs": {
-      "tile_config": {
-        "name": "分块配置",
-        "tooltip": "'MMH3 Spatial Tile Editor' 输出的分块配置。"
-      },
-      "fade_mode": {
-        "name": "渐变模式",
-        "tooltip": "控制拼接重叠带 mask 形状：flat（固定整带值）、gradient（空间渐变）、hybrid（混合）。"
-      },
-      "flat_fade_value": {
-        "name": "平面渐变值",
-        "tooltip": "fade_mode 为 'flat' 时整个渐变带的 mask 值。值越低冻结越强（保留更多锚点内容），越高注入更多噪声、生成自由度越高。"
-      },
-      "ref_mode": {
-        "name": "参考模式",
-        "tooltip": "相位 5.5 如何解析相邻参考：use_ref_image 使用前一帧，use_overlap 使用重叠区。"
-      },
-      "overlap_mode": {
-        "name": "重叠归属",
-        "tooltip": "拼接时每一共享重叠带由谁获胜。"
-      },
-      "overlap_blend": {
-        "name": "重叠过渡",
-        "tooltip": "拼接时重叠带如何过渡。"
-      }
-    },
-    "outputs": {
-      "0": {
-        "tooltip": "合并为一个 MiniMax H3 AV 潜变量的各分块。音频通道为分块 0 生成的音频。"
-      },
-      "1": {
-        "tooltip": "分块 0 自身的结果，作为独立的 MiniMax H3 AV 潜变量。"
-      }
-    }
-  },
-  "MMH3LastQuadrantPatch": {
-    "display_name": "MMH3 末象限补丁"
+  "outputs": {
+   "0": {
+    "tooltip": "供 'MMH3 Spatial Extend Video' 使用的完整分块配置（纯字典/文本）。"
+   },
+   "1": {
+    "tooltip": "可检查的几何信息摘要：分块数量、布局方案、尺寸，以及每个分块的 compose 裁剪框。"
+   }
   }
+ },
+ "MMH3SpatialExtendVideo": {
+  "display_name": "MMH3 空间扩展视频",
+  "description": "基于分块的 H3 视频扩展节点：将 tile_config（来自 'MMH3 Spatial Tile Editor'）提供的布局切分为多个分块，逐块采样并拼接成一张更大的视频。每个分块独立地（按 cond_mode）按其参考图像生成首帧/首尾帧（FL2VA）或主体参考块（Ref2VA）；compose 模式下各分块使用其裁剪区。采样参数经 'MMH3 Sample Params' 子节点传入。",
+  "inputs": {
+   "tile_config": {
+    "name": "分块配置",
+    "tooltip": "'MMH3 Spatial Tile Editor' 输出的分块配置。"
+   },
+   "sample_params": {
+    "name": "采样参数",
+    "tooltip": "来自 'MMH3 Sample Params' 子节点的采样参数：HIGH 阶段（注入噪声）+ 可选 LOW 阶段（不注噪）。用于每个分块的第一遍采样。"
+   },
+   "2nd_sample_params": {
+    "name": "二次采样参数",
+    "tooltip": "实验性。第二遍精修的采样参数：从第 2 块起，在第一遍采样与重叠混合之后对每块再降噪一次；其 HIGH 阶段驱动该遍，可选 LOW 阶段继续。不连接则禁用第二遍。"
+   },
+   "fade_impl": {
+    "name": "渐变实现",
+    "tooltip": "实验性。渐变的实现方式：'mask' = 默认软噪声掩码过渡带（存在介于 0/1 之间的逐 token timestep，H3 上已知会产生马赛克状瑕疵）；'qsample_init' = 过渡带保持完整强度 timestep，过渡通过把邻居重叠区内容按内容轮廓混入初始噪声来引导，自冻结侧向分块内部逐渐衰减。相比 'mask' 的优势：过渡带不会遇到中间 timestep，接缝处内容成功延续的概率更高，且没有任何额外开销。采样器要求：只能搭配每步重新注入新鲜噪声的随机（SDE 型）采样器才能正常工作（sa_solver、er_sde、dpmpp_2m_sde、dpmpp_3m_sde 等）；确定性 ODE 采样器（euler、res_multistep、uni_pc、dpmpp_2m 等）会使过渡带出现亮度/饱和度漂移。"
+   },
+   "init_content_weight": {
+    "name": "初始内容权重",
+    "tooltip": "实验性，仅在 fade_impl='qsample_init' 时生效。限制初始噪声中携带邻居结构的强度（1.0 = 全强度结构；0 = 纯噪声）。结构化初始态在 t=σ_max 处于分布外，模型可能过度发展它（亮度/饱和度漂移）。搭配兼容的随机采样器（er_sde / sa_solver / dpmpp_2m_sde / dpmpp_3m_sde）时即使 1.0 一般也正常；确定性 ODE 采样器上无论取值多少都会出现漂移。负值（实验）：过渡带携带符号翻转的反相关邻居结构——这并不是「与邻居更不同」（0 已经是最大独立），起点仍被参考钉住只是方向取反，可能出现镜像/反转式发展，也可能毫无效果。"
+   },
+   "fade_mode": {
+    "name": "渐变模式",
+    "tooltip": "控制拼接重叠带 mask 形状：flat（固定整带值）、gradient（空间渐变）、hybrid（混合）。"
+   },
+   "flat_fade_value": {
+    "name": "平面渐变值",
+    "tooltip": "fade_mode 为 'flat' 时整个渐变带的 mask 值。值越低冻结越强（保留更多锚点内容），越高注入更多噪声、生成自由度越高。选择 fade_impl='qsample_init' 时，该值只塑造初始噪声的内容轮廓，不再作用于采样 mask。"
+   },
+   "ref_mode": {
+    "name": "参考模式",
+    "tooltip": "相位 5.5 如何解析相邻参考：use_ref_image 使用前一帧，use_overlap 使用重叠区。"
+   },
+   "overlap_mode": {
+    "name": "重叠归属",
+    "tooltip": "拼接时每一共享重叠带由谁获胜。"
+   },
+   "overlap_blend": {
+    "name": "重叠过渡",
+    "tooltip": "拼接时重叠带如何过渡。"
+   }
+  },
+  "outputs": {
+   "0": {
+    "tooltip": "合并为一个 MiniMax H3 AV 潜变量的各分块。音频通道为分块 0 生成的音频。"
+   },
+   "1": {
+    "tooltip": "分块 0 自身的结果，作为独立的 MiniMax H3 AV 潜变量。"
+   }
+  }
+ },
+ "MMH3LastQuadrantPatch": {
+  "display_name": "MMH3 末象限补丁"
+ },
+ "MMH3LatentPreview": {
+  "display_name": "MMH3 潜空间预览（近似）",
+  "description": "实验性节点。用快速的小型 H3 VAE（models/vae_approx 中的 taeh3）解码一个已完成采样的 H3 潜变量，并直接把视频内嵌显示在本节点上，不输出 IMAGE 张量。在 'latent_file' 指定已保存的潜变量文件位置并结合预览参数，复用可调用接口 decode_h3_video_frames() / frames_to_animated_webp()，便于其他节点 / JS 调用同一管线。",
+  "inputs": {
+   "latent": {
+    "name": "潜变量",
+    "tooltip": "内存中的 H3 潜变量（例如来自 Latent 加载器 / VAE 编码 / Extend Video 节点）。优先于 latent_file。"
+   },
+   "latent_file": {
+    "name": "潜变量文件",
+    "tooltip": "已保存的 H3 潜变量文件路径或文件名（.safetensors / .latent）。与 Load Latent 相同方式经 folder_paths 解析。仅在未连接 'latent' 时使用。"
+   },
+   "approx_vae": {
+    "name": "近似解码器",
+    "tooltip": "来自 models/vae_approx 的小型 H3 VAE 解码器（例如 taeh3.safetensors）。"
+   },
+   "device": {
+    "name": "计算设备",
+    "tooltip": "解码设备。'auto' 使用 ComfyUI 默认 VAE 设备（有 CUDA 则用 CUDA）；'cuda'/'cpu' 强制用该设备解码（用于对比 CPU 速度）。"
+   },
+   "cpu_threads": {
+    "name": "CPU 线程数",
+    "tooltip": "当 device=cpu 时使用的线程数。0 = 全部核心（8C16T 即 16）。cuda 下忽略。用于对比 CPU 解码速度。"
+   },
+   "max_frames": {
+    "name": "最大帧数",
+    "tooltip": "0 = 输出全部解码帧；否则均匀采样该数量的帧用于预览。"
+   },
+   "max_resolution": {
+    "name": "最大分辨率",
+    "tooltip": "最长边像素上限（0 = 保持原生）。用于缩小预览 WebP。"
+   },
+   "fps": {
+    "name": "帧率",
+    "tooltip": "预览 WebP 的播放帧率（每秒帧数）。"
+   }
+  },
+  "outputs": {
+   "0": {
+    "tooltip": "解码预览的文本摘要：帧数、分辨率、帧率。"
+   }
+  }
+ },
+ "MMH3TemporalOverlapParams": {
+  "display_name": "MMH3 时序重叠参数",
+  "description": "'MMH3 Temporal Extend Video' 的全局接续参数子节点：前一段尾部如何延续到下一段（冻结/淡出行为）、淡出带长度与强度、接缝锚定、可选的「接缝参考」视频引用以及重叠带归属与混合曲线。作用于链条中所有延续分段；接续尾部的长度由时序分段编辑器里每段各自的「重叠帧数」单独设置。",
+  "inputs": {
+   "tail_mode": {
+    "name": "尾部模式",
+    "tooltip": "接续尾部的行为：'冻结 + 淡出' 将冻结区钉死并淡入新内容；'自由重采样' 让整个尾部重新采样（实验性）。"
+   },
+   "fade_frames": {
+    "name": "淡出帧数",
+    "tooltip": "接续尾部与新内容之间淡出过渡带的帧长（像素帧）。0 = 无淡出：整个尾部保持冻结，新内容硬切入。其他值向上吸附到 17 的倍数。默认 0。"
+   },
+   "fade_value": {
+    "name": "淡出强度",
+    "tooltip": "过渡处的淡出强度（0 = 硬切向新内容，1 = 保留尾部）。"
+   },
+   "fade_mode": {
+    "name": "淡出曲线",
+    "tooltip": "过渡带内的淡出形状。"
+   },
+   "fade_impl": {
+    "name": "淡出实现",
+    "tooltip": "实验性，后续可能移除。淡出的实现方式：'mask' = 默认软噪声掩码过渡带（存在介于 0/1 之间的逐行 timestep，H3 上已知会产生马赛克状瑕疵）；'qsample_init' = 过渡带保持完整强度 timestep，过渡通过把携带内容按 fade 曲线混入初始噪声来引导，随采样推进逐渐衰减。相比 'mask' 的优势：过渡带不会遇到中间 timestep，后续内容成功接续的概率更高，且没有任何额外开销。采样器要求：只能搭配每步重新注入新鲜噪声的随机（SDE 型）采样器才能正常工作（sa_solver、er_sde、dpmpp_2m_sde、dpmpp_3m_sde 等）；确定性 ODE 采样器（euler、res_multistep、uni_pc、dpmpp_2m 等）会使过渡带出现亮度/饱和度漂移。"
+   },
+   "init_content_weight": {
+    "name": "初始内容权重",
+    "tooltip": "实验性，仅在 fade_impl='qsample_init' 时生效。限制初始噪声中携带内容结构的强度（1.0 = 与之前相同的全强度结构；0 = 纯噪声）。t=σ_max 的结构化初始态是分布外的，模型会过度发展它——这正是严重亮度/饱和度漂移的源头。开启「接缝参考」='prev_tail' 后连续性由逐比特精确的参考承担，不再依赖 init，建议从 0.3～0.6 起试。搭配兼容的随机采样器（er_sde / sa_solver / dpmpp_2m_sde / dpmpp_3m_sde）时即使 1.0 也正常；确定性 ODE 采样器（euler、res_multistep、uni_pc、dpmpp_2m 等）上无论取值多少都会出现漂移。负值（实验）：过渡带携带符号翻转的反相关结构——这并不是「与原内容更不同」（0 已经是最大独立），起点仍被参考钉住只是方向取反，可能出现镜像/反转式发展，也可能毫无效果。"
+   },
+   "max_mask_strength": {
+    "name": "最大掩码强度",
+    "tooltip": "冻结 + 淡出整体掩码的强度。1 = 最大：冻结区完全保持（掩码 0），淡出带跑完整渐变。0 = 完全没有掩码：冻结区不保持、淡出带消失，整个携带尾部重新采样（相当于 'free resample'）。中间值按比例保持冻结区，并随其缩放淡出渐变（冻结区掩码值 = 1 - s，淡出渐变从 1 - s 跑到 1）。"
+   },
+   "keyframes_mode": {
+    "name": "关键帧",
+    "tooltip": "分割后对前段关键帧的处理：'重新锚定' 移到新分割点，'丢弃' 移除，'保留' 原样保留。"
+   },
+   "anchor_seam": {
+    "name": "接缝锚定",
+    "tooltip": "在分割帧处锚定条件，使接缝保持原位。"
+   },
+   "anchor_strength": {
+    "name": "锚定强度",
+    "tooltip": "接缝锚定强度（1.0 = 硬性钉死）。"
+   },
+   "seam_reference": {
+    "name": "接缝参考",
+    "tooltip": "不依赖淡出的接缝连续性方案：'prev_tail' 将上一段合并视频的尾部作为逐比特精确的 latent 视频参考，并连同其音轨（尾段音频 latent 一并输入，块类型 video_audio），通过原生 Ref2VA 机制喂给每个延续分段——不经过软噪声掩码，因此不会产生马赛克瑕疵。建议配合 fade_frames=0 和较大的每段「重叠帧数」使用。"
+   },
+   "seam_ref_frames": {
+    "name": "接缝参考帧数",
+    "tooltip": "接缝参考覆盖上一段合并视频的像素帧数，吸附到 17m+5 网格（5、22、39…）。0 = 整个携带尾部（该段的重叠帧数）。seam_reference 为 'none' 时忽略。"
+   },
+   "overlap_mode": {
+    "name": "重叠归属",
+    "tooltip": "重叠带归属：'later' = 新分段，'earlier' = 已积累视频。"
+   },
+   "overlap_blend": {
+    "name": "混合曲线",
+    "tooltip": "重叠带内的混合曲线（'overwrite' = 不混合）。当存在 fade 带时，混合 ramp 只作用于冻结区（两侧内容逐比特相同，混合仅用于平滑二次采样等带来的微小差别），重发展的 fade 带整体归新分段——对两个真实不同的演绎做交叉淡化只会产生叠影。"
+   }
+  },
+  "outputs": {
+   "0": {
+    "tooltip": "连接到 'MMH3 Temporal Extend Video' 的 overlap_params 输入。"
+   }
+  }
+ },
+ "MMH3TemporalOverlapSimple": {
+  "display_name": "MMH3 时序重叠参数（简洁）",
+  "description": "简化版 'MMH3 Temporal Overlap Params'：四套现成预设，无需逐项配置。选择一个预设、按需设置淡出带长度，把输出接到 'MMH3 Temporal Extend Video' 的 overlap_params 输入即可（与完整版共用同一接口）。作用于链条中所有续采分段；携带尾部的长度仍由时序分段编辑器里每段的「重叠帧数」单独设置。需要精细调节时请改用完整的 'MMH3 Temporal Overlap Params'。",
+  "inputs": {
+   "preset": {
+    "name": "预设",
+    "tooltip": "一键式接续预设：'high continuity'（顺滑过渡）= 平滑，冻结＋淡出渐变掩码、满掩码强度加硬接缝锚点（轮次数目太多画质会逐渐劣化）；'low deterioration'（低劣化）= 过渡顺滑且几乎没有画质劣化，但内容一致性容易跳变（弱 0.2 掩码，无接缝锚点）；'soft restart'（软重启）= 几乎没有画质劣化，携带尾部重新采样、新分段整体覆盖过渡带（大致保持连续性，但过渡有微小跳变）；'H3 video reference'（H3视频参考）= 使用 H3 原生参考视频功能，通过覆盖整个尾部的 'prev tail' 接缝参考（0 = 所有携带帧）实现，需要配合提示词使用，且采样所需时间大幅加长。"
+   },
+   "fade_frames": {
+    "name": "淡出帧数",
+    "tooltip": "接续尾部与新内容之间淡出过渡带的帧长（像素帧），其他值向上吸附到 17 的倍数。0 = 无淡出：整个尾部保持冻结，新内容硬切入。不得超过该段实际携带的尾部长度（编辑器里的「重叠帧数」）。'soft restart' 与 'H3 video reference' 预设会忽略此值（整个尾部重新采样）；'H3 video reference' 建议设为 0，因为其接缝参考已经承担了连续性。"
+   }
+  },
+  "outputs": {
+   "0": {
+    "tooltip": "连接到 'MMH3 Temporal Extend Video' 的 overlap_params 输入（与完整版 'MMH3 Temporal Overlap Params' 共用同一接口）。"
+   }
+  }
+ },
+ "MMH3TemporalTileEditor": {
+  "display_name": "MMH3 时序分块编辑器",
+  "description": "'MMH3 Temporal Extend Video' 的逐段配置节点。停靠面板编辑器：每个分段携带自己的条件模式、提示词、种子、参考图像与时长；分段 0 全新生成视频（FL2VA 或 Ref2VA）且其分辨率锁定整条链，后续分段接续上一尾部（Ref2VA / 仅尾帧的 FL2VA / 无参考），可引用上一分段的某一帧作参考。历史预览让你直接选定从某个分段重跑而不必重跑之前的分段。纯信息节点：不加载图像、不输出张量。当一次运行包含多个待采样分段、且没有任何分段引用「上一分段帧」时，所有可静态编码的 CLIP/VAE 条目（各段提示词、参考图像、首/尾帧）会在 H3 采样开始前一次性编码完成，避免采样过程中在文本编码器与 DiT 之间反复切换模型；引用上一分段输出（'prev_frame' 参考，以及首个采样段之后的 'prev_tail' 接缝参考）的分段仍只能在循环内编码——其输入要等前面的段采样完才存在。分段还可以选『自动裁切背景音乐』音频参考模式：把可选的 'audio_BGM' 输入（一首歌）按该分段在整条链时间轴上的绝对位置切出对应片段，经音频 VAE 编码后由音频噪声掩码冻结——该段的音轨就是这段音乐本身，模型只在它之上生成画面；音乐按分段逐个编码（只有该段需要的那一段送进音频 VAE），显存峰值只与单个分段相关，而不是整首歌一次性编码；所有分段都这么用时，整条链拼接后的音轨就是这首 BGM 的开头部分；音乐短于成片时，从它结束的位置起由模型自然接续（它已经听到的音乐会被用作继续生成的上下文，因此听起来是软过渡而非硬切）。",
+  "inputs": {
+   "show_editor": {
+    "name": "显示编辑器",
+    "tooltip": "切换可视化停靠编辑器面板的显示/隐藏。"
+   },
+   "session_name": {
+    "name": "会话名称",
+    "tooltip": "会话目录名：<temp|output/latents>/mmh3_temporal/<名称>/ 下的 latents 与 previews 子目录。同一存储位置的所有会话共享同级 cache 目录中的参考 latent 与 conditioning 缓存。"
+   },
+   "storage_location": {
+    "name": "存储位置",
+    "tooltip": "逐段潜变量（.h3latent）与预览 WebP 的存放位置：<位置>/mmh3_temporal/<会话>/{latents,previews}，同级 cache 目录缓存参考 latent 与已编码 conditioning 供所有会话复用（参考图/视频/音频与提示词不变时跳过 VAE 与文本编码器）。'temp' 重启后清空；'output/latents' 长期保留。"
+   },
+   "base_prompt": {
+    "name": "基础提示词",
+    "tooltip": "应用于所有分段的共享正向提示词前缀。"
+   },
+   "base_negative": {
+    "name": "基础负向提示词",
+    "tooltip": "应用于所有分段的共享负向提示词。"
+   },
+   "tile_data": {
+    "name": "分段数据",
+    "tooltip": "由停靠编辑器管理的内部 JSON。"
+   },
+   "ref_images": {
+    "name": "参考图像（图像输入）",
+    "tooltip": "直连 IMAGE 输入端点：'First_or_Ref_Image_0'、'Last_or_Ref_Image_1'，其后为 'Ref_Image_2'…… 连接 LoadImage 即等效于在停靠面板中挑选文件。默认所有分段都会把这些已连入的图像当作『加载图像』参考使用；端点 0 兼作分段 0 的 FL2VA 首帧、端点 1 兼作 FL2VA 尾帧（该位置未挑选文件时）。若只想让某个分段不用某张连入图像，在编辑器的参考图像栏点击该虚拟缩略图右上角的 × 即可（其余分段不受影响）。图像顺序即提示词顺序：已连入端点在前、手动挑选的文件在后，从左到右依次对应 Ref2VA 提示词中的 <Picture 1>、<Picture 2>……（编辑器会给每个缩略图打上 P1/P2 角标）。每个端点只算一张参考图：端点接入多图 batch 时只取第一张（与 MiniMax H3 Reference to Video 一致），因此提示词里一个端点对应一个 <Picture i>。端点图像在本节点不做任何缩放或合并（避免高宽比被拉伸），尺寸由 Extend 节点按分段的「参考图尺寸」等比缩放。"
+   },
+   "audio_bgm": {
+    "name": "背景音乐（音频输入）",
+    "tooltip": "可选。整条链的配乐——一首与成片时长相当的歌。连接后把某个分段的『音频参考模式』设为『自动裁切背景音乐』：该段的音轨会按它自己在链条时间轴上的位置（由前面各段的帧数决定偏移量）从这段音频中切出，经 Extend 节点的音频 VAE 编码、并用音频噪声掩码冻结——该段的音频就是这段音乐，模型只在它之上生成视频（模型仍然『听得到』这段音乐）。音乐是「按分段逐个编码」的：只有该段需要的那一段会送进音频 VAE，所以显存峰值只与单个分段相关，而不是整首歌一次性编码。未使用该模式的分段仍保留自己的音轨，所以可按段切换。音乐短于成片时，从它结束的位置起由模型自然接续——模型已经听到的音乐会被用作继续生成的上下文，所以是软过渡，不会出现硬切。用了该模式却没有接音频 VAE 时，Extend 节点会在开始采样之前直接报错。不连接 = 使用该模式的分段会被拒绝。"
+   }
+  },
+  "outputs": {
+   "0": {
+    "tooltip": "供 'MMH3 Temporal Extend Video' 使用的完整逐段配置。"
+   },
+   "1": {
+    "tooltip": "可检查的摘要：会话、存储位置、分段数量以及每个分段的参数。"
+   },
+   "2": {
+    "tooltip": "把已连入的参考图端点交给 'MMH3 Temporal Extend Video'（其 'ref_image_slots' 输入）：每个端点一条记录（端点名、槽位、图片张数、原生分辨率的张量），按端点顺序排列。这里不缩放、不合并——由 Extend 节点按每个分段的「参考图尺寸」（match / max）等比缩放，与手动挑选的文件走完全相同的路径。未连接任何端点时为空。"
+   }
+  }
+ },
+ "MMH3TemporalExtendVideo": {
+  "inputs": {
+   "clip": {
+    "name": "CLIP",
+    "tooltip": "MiniMax H3 CLIP——在节点内部构建每个分段的条件（提示词、关键帧、参考图）。"
+   },
+   "vae": {
+    "name": "VAE",
+    "tooltip": "MiniMax H3 视频 VAE——为各分段条件编码参考图 / 关键帧。"
+   },
+   "temporal_tile_config": {
+    "name": "时间分块配置",
+    "tooltip": "来自 'MMH3 Temporal Tile Editor' 节点的分段配置。"
+   },
+   "sample_params": {
+    "name": "采样参数",
+    "tooltip": "来自 'MMH3 Sample Params' 子节点的采样参数：HIGH 阶段（注入噪声）+ 可选 LOW 阶段（不注噪）。"
+   },
+   "2nd_sample_params": {
+    "name": "二次采样参数",
+    "tooltip": "可选。用于续采段（seg≥1）第二遍精修采样的参数子节点：整个分段 latent（携带尾部+新内容，音视频一起）以无噪声掩码、无关键帧的方式重采——参考图与接缝参考继续生效。建议使用低降噪 sigma 调度（如 SplitSigmas 的 low 输出），把累积内容拉回模型流形；刷新内容与未刷新历史的过渡由重叠带上的线性混合完成。不连接 = 不启用。"
+   },
+   "overlap_params": {
+    "name": "重叠参数",
+    "tooltip": "可选。来自 'MMH3 Temporal Overlap Params'（精细调节）或 'MMH3 Temporal Overlap Simple'（一键预设）的全局尾部/渐变/锚定/重叠参数——两者共用同一接口，只连其中一个。作用于每个续采分段。不连接时使用默认值（或 Tile Editor 的旧版全局 extend_params）。"
+   },
+   "audio_vae": {
+    "name": "音频 VAE",
+    "tooltip": "MiniMax H3 音频 VAE——仅当分段参考音频文件（音频参考模式“加载音频”，或参考视频原声）时需要；潜空间级音频参考（“上一段音频”/“开场音频”）不需要音频 VAE。没有它文件参考音频只条件化文本编码器。"
+   },
+   "latent_seg_0": {
+    "name": "分段0潜变量",
+    "tooltip": "可选。作为接续起点的完整 H3 AV 潜变量。与 resume_from_segment=0 一起连接时，分段 0 在此 latent 基础上扩展而非全新生成；resume > 0 时使用会话存储的 merged latent，该输入被忽略。"
+   },
+   "second_pass_audio": {
+    "name": "二次采样音轨",
+    "tooltip": "第二遍启用时拼接哪一遍的音频：'second' = 重采后的音频，'first' = 第一遍原始音频（视频始终取第二遍结果）。"
+   },
+   "ref_image_slots": {
+    "name": "参考图端点",
+    "tooltip": "来自 'MMH3 Temporal Tile Editor' 的 'ref_image_slots' 输出：每条记录是一个已连入的参考图端点，保持各自的原生分辨率与端点顺序。所有分段默认把它们当作「加载图像」参考图使用，除该分段在编辑器里排除掉的端点之外；每张图按该分段的「参考图尺寸」（match / max）等比缩放，与手动挑选的文件走完全相同的路径。'First_or_Ref_Image_0' / 'Last_or_Ref_Image_1' 在未挑选首/尾帧文件时，还兼作分段 0 FL2VA 的首帧 / 尾帧。一个端点只算一张参考图：接入多图 batch 时只取第一张（与 MiniMax H3 Reference to Video 一致）。未连接时只使用编辑器里手动挑选的文件。"
+   }
+  }
+ }
 }
