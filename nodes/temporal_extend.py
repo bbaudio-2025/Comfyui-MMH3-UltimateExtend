@@ -36,7 +36,12 @@ import comfy.nested_tensor
 from comfy_api.latest import io
 
 from .helpers import blend_weights, is_h3_av_latent, sample_piece
-from .temporal_tile_editor import REF_SOCKET_NAMES, snap_17, snap_17n5
+# `_mute_stop` is the Tile Editor's OWN reader for the chain's stop point
+# ('mute'): imported, never copied, so the editor's gate and the one below
+# cannot drift apart.
+from .temporal_tile_editor import (CONTROL_BUNDLE_KIND, CONTROL_SLOTS,
+                                   MATERIAL_SIDES, REF_SOCKET_NAMES,
+                                   _mute_stop, snap_17, snap_17n5)
 
 # typed link between the MMH3 Sample Params sub-node and the Temporal Extend node
 SAMPLE_PARAMS = io.Custom("MMH3_SAMPLE_PARAMS")
@@ -61,6 +66,14 @@ try:
 except Exception:
     FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
     FRAME_RESCALE = 5.0 / 3.0
+
+try:
+    # pixel-space canvas alignment of the H3 family (the video latent is 16x
+    # downsampled and the DiT patches 2x2, so 32 px IS one token column/row -
+    # material_geometry sizes the canvas strip on it)
+    from comfy_extras.nodes_minimax_h3 import CANVAS_MULTIPLE
+except Exception:  # pragma: no cover
+    CANVAS_MULTIPLE = 32
 
 try:
     from comfy_extras.nodes_custom_sampler import Noise_RandomNoise
@@ -191,8 +204,10 @@ def snap_split_frame(frame_count, tail_frames):
 
     Only boundaries at token indices that are a multiple of 5 (one keyframe
     grid step = 17 frames) are considered, and never at/after the latent's end,
-    so the realized tail is always at least the final keyframe token. Returns
-    (video_token_index, exact_pixel_frames)."""
+    so the realized tail is always at least the final keyframe token - the
+    ``max(5, ...)`` floor below, which is NOT cosmetic: it is what keeps the
+    next piece's token-group anchors in phase with the chain's (see
+    seam_split). Returns (video_token_index, exact_pixel_frames)."""
     target = frame_count - max(5, int(tail_frames))
     best_k, best_f, best_d = 0, 0, abs(0 - target)
     k = 5
@@ -205,6 +220,55 @@ def snap_split_frame(frame_count, tail_frames):
             best_k, best_f, best_d = k, f, d
         k += 5
     return best_k, best_f
+
+
+def seam_split(frame_count, tail_frames):
+    """Where one continuation segment is cut into the accumulated chain.
+
+    Returns ``(k_split, f_split, tail_real)``: the video TOKEN the piece takes
+    over at, the pixel frame of that boundary, and the frames the piece
+    re-covers before generating (``frame_count - f_split``).
+
+    ONE source of truth. Four places need this exact integer triple - the
+    pre-scan that sizes the segment's strip / control / bgm windows, the 'prev'
+    audio reference's anchor, the bgm slice's start, and _prepare_continuation
+    itself. While each computed it locally they drifted apart, and a change to
+    one of them silently desynced the others (see the 2026-09-16 hard-cut bug in
+    mmh3_plugin_ref.md), so they all call this now.
+
+    ``tail_frames <= 0`` is the HARD CUT ('carry no tail'), and it CANNOT be
+    taken literally - the token-group grid is what makes the merged latent
+    decodable at all:
+
+    * a video latent row covers ``FRAME_PER_TOKEN[i % 5]`` pixel frames (1 then
+      four 4s), that pattern is anchored at the latent's ROW 0, and one group of
+      5 rows is exactly 17 frames;
+    * the accumulated chain is always ``17k + 5`` frames = ``5k + 2`` tokens, so
+      its token index of a boundary is always ``2 (mod 5)``;
+    * a piece spliced in there carries its OWN row 0 as its first group anchor,
+      so it only stays in phase when it starts at a chain token that is a
+      MULTIPLE of 5.
+
+    A carried tail gives that for free: ``tail_real`` is always ``5 + 17n``, so
+    ``k_split = (5k + 2) - (2 + 5n) = 5(k - n)`` - a multiple of 5, which is why
+    every ordinary continuation decodes correctly. A tail of exactly 0 puts
+    ``k_split`` at the chain's END instead, i.e. at ``... + 5k + 2``: MID-group.
+    The piece's group anchors then sit at ``2 (mod 5)`` and the VAE reads the
+    whole hard-cut region on the wrong group phase - measured directly in the
+    saved latents as the periodic high-DC 'anchor' rows appearing at
+    ``token % 5 == 2`` instead of ``0`` (seg0 and a carried-tail segment in the
+    same chain both measure 0), which surfaces as colour/luma corruption
+    pulsing once every 17 frames.
+
+    So a hard cut realizes the SMALLEST legal seam - 5 frames, the final
+    keyframe token, which ``snap_split_frame``'s ``max(5, ...)`` floor already
+    produces. The piece still carries those 5 frames, and the hard cut's forced
+    ``fade_frames = 0`` FROZENS them (mask 0), i.e. they are re-stitched
+    byte-exact over content the finished video already showed: the picture's
+    boundary lands exactly where the user asked for it and nothing about the
+    seam is visible. What the hard cut changes is the FADE, not the boundary."""
+    k, f = snap_split_frame(frame_count, tail_frames)
+    return k, f, frame_count - f
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +522,555 @@ def _load_input_video_frames(filename, max_seconds=15.0):
     return img
 
 
+def _auto_crop_video_frames(video_obj, windows, padded=None):
+    """Decode a ComfyUI VIDEO input for a set of timeline windows, putting each
+    on the chain's 24 fps clock (the degradation itself lives in
+    _control_frames). The chain always runs at 24 fps, so a source recorded at
+    any other rate is converted here (the caller's measure of effort for a
+    segment is *frames* at 24 fps; the window is that many frames' worth of
+    wall-clock seconds). ``windows`` is an iterable of
+    ``(seg_index, t0_sec, t1_sec, out_len)`` - one window per auto-crop segment,
+    seconds already derived from the chain's cumulative frame position
+    (t0 = segment's absolute start / 24, t1 = its end / 24). Only the frames
+    inside the current window are held at any moment, so peak memory stays
+    proportional to ONE slice rather than the whole video (the whole point of
+    keeping this socket a VIDEO/file, not an IMAGE tensor). Returns
+    ``{seg_index -> [out_len, H, W, 3] tensor (0..1) | None}``; None only when
+    the source holds no decodable frame at all, because a window the source
+    cannot fill is PADDED with its LAST frame instead - never stretched, never
+    empty (see _control_frames and _pad_unreachable). The chain runs on the
+    source's OWN clock, so a source shorter than the chain holds its last frame
+    for the rest of it, exactly as a source ending INSIDE a window already
+    did. Keys that had to be filled that way are appended to the optional
+    ``padded`` list, so the caller can report them."""
+    import av
+    if not windows:
+        return {}
+    source = video_obj.get_stream_source()
+    windows = sorted(windows, key=lambda w: w[1])          # by start time
+    results = {w[0]: None for w in windows}
+    wi = 0
+    buf = []                                               # source rgb24 uint8 frames (raw numpy, small)
+    # The last frame this pass decodes, held as a reference (no colour
+    # conversion). It is the fill for a window the source cannot reach, and it
+    # is the video's OWN last frame in exactly that case: an unresolved window
+    # keeps the loop below running to EOF.
+    last = None
+    with av.open(source) as container:
+        vstream = container.streams.video[0]
+        src_fps = None
+        try:
+            _r = video_obj.get_frame_rate()
+            if _r and _r > 0:
+                src_fps = float(_r)
+        except Exception:
+            src_fps = None
+        if not src_fps:
+            _r = vstream.average_rate or (
+                vstream.frames / vstream.duration if vstream.duration else None)
+            if _r:
+                src_fps = float(_r)
+        if not src_fps or src_fps <= 0:
+            src_fps = 24.0
+        for frame in container.decode(video=0):
+            last = frame
+            ts = float(frame.time) if frame.time is not None else -1.0
+            if wi < len(windows):
+                w0, w1, out_len = windows[wi][1], windows[wi][2], windows[wi][3]
+                if ts < w0:
+                    continue
+                if ts < w1:
+                    try:
+                        buf.append(frame.to_ndarray(format="rgb24"))
+                    except Exception:
+                        pass
+                else:
+                    results[windows[wi][0]] = _control_frames(buf, src_fps, out_len)
+                    buf = []
+                    wi += 1
+                    # restart the same frame against the next window (frame can
+                    # straddle two abutting windows only on <=duration edge; safe)
+                    if wi < len(windows):
+                        w0 = windows[wi][1]
+                        if ts >= w0 and ts < windows[wi][2]:
+                            buf.append(frame.to_ndarray(format="rgb24"))
+        if wi < len(windows) and buf:
+            results[windows[wi][0]] = _control_frames(buf, src_fps,
+                                                       windows[wi][3])
+        # ...and every window the source could not reach at all (the chain
+        # outruns the video) is filled with the video's LAST frame, the
+        # whole-window half of the same rule.
+        _pad_unreachable(results, windows, src_fps, last, padded)
+    return results
+
+
+def _pad_unreachable(results, windows, src_fps, last, padded=None):
+    """Fill every window the source cannot reach with the source's LAST frame.
+
+    Called by both decoders with the last frame THEIR pass decoded (``last``,
+    an av frame - or None when the source is empty). A window is unreachable
+    when the source ended before it starts; the pass then ran to EOF (an
+    unresolved window keeps a decoder's loop open - see the two callers), which
+    is what makes ``last`` the video's own last frame. Deliberately not passed
+    a frame from an early-exiting pass.
+
+    This is the whole-window half of ONE rule: a source shorter than the piece
+    holds its last frame (the clamp inside _control_frames), so a source that
+    ends mid-chain holds it for the rest of the chain - the same content shift
+    whether the video ran out inside a window or before the window began.
+
+    Keys actually filled are appended to ``padded`` (a list the caller passes
+    when it wants to report them); nothing is filled when ``last`` is None or
+    the frame cannot be converted, and the caller's own 'no frame at all'
+    handling then stands."""
+    gaps = [w for w in windows if int(w[3]) > 0 and results.get(w[0]) is None]
+    if not gaps or last is None:
+        return
+    try:
+        fill = last.to_ndarray(format="rgb24")
+    except Exception:
+        return
+    for w in gaps:
+        results[w[0]] = _control_frames([], src_fps, int(w[3]), fallback=fill)
+        if padded is not None:
+            padded.append(w[0])
+
+
+# ── fun control (MiniMax H3 Fun ControlNet) ────────────────────────────────
+# The control hint is a MODEL-SIDE patch (see comfy_extras/nodes_minimax_h3.py:
+# MiniMaxH3FunControlPatch), so it is orthogonal to every conditioning this
+# node builds. What the plugin must supply is the per-segment SLICE of the
+# control video: the native patch's _fit_frames always starts at index 0, so
+# without slicing every segment would be controlled by the video's opening
+# frames (the same "rewind" the BGM slices exist to avoid).
+
+def control_slice_window(mode, cum, tail_real, total):
+    """Absolute frame window ``(start, count)`` of one segment's control slice.
+
+    'auto_crop' - the segment's piece covers chain frames
+    ``[cum - tail_real, cum + tail_real + new_frames)``: its carried tail
+    re-covers the previous segment's last ``tail_real`` frames, so the control
+    slice must start one carried tail BEFORE the segment boundary ``cum`` and
+    be as long as the whole piece (``total``). Abutting slices then reassemble
+    the control video continuously. A carried tail covering the whole
+    accumulated chain clamps the start to 0 (the same edge case the BGM slice
+    clamps on - see snap_split_frame); the LENGTH stays ``total``, so the
+    control holds its first frame over the missing prefix instead of sliding.
+
+    'whole' - the control video from its FIRST frame, ``total`` frames long.
+    That is exactly what the native Apply node does (only ever meaningful for
+    a still image or a looping control signal), and it is what makes a plain
+    single-image control work without any chain arithmetic.
+    """
+    if mode == "whole":
+        return 0, max(0, int(total))
+    return max(0, int(cum) - int(tail_real)), max(0, int(total))
+
+
+def material_window(cum, tail_real, total):
+    """Strip window ``(start, count, lead)`` on the chain timeline.
+
+    Same chain arithmetic as control_slice_window's 'auto_crop' case - open one
+    carried tail before the segment boundary and run for the whole piece - but
+    a control latent is consumed per frame while the strip is a VIDEO that gets
+    VAE-encoded on its own, so this window additionally has to sit on the
+    model's 17-frame group grid.
+
+    A video latent row covers ``FRAME_PER_TOKEN[i % 5]`` pixel frames (1 for a
+    group's first row, 4 for the rest) and that pattern is anchored at the
+    latent's row 0, so a clip encoded on its own only lands on a piece's rows
+    when it STARTS on a row boundary of the chain's own latent. A carried tail
+    gives that for free - ``tail_real`` is always ``5 + 17n`` (a hard cut
+    included: seam_split realizes the smallest legal seam rather than a tail of
+    0), so ``cum - tail_real`` is a multiple of 17, a group start, and ``lead``
+    is 0 for every chain on the usual ``17k + 5`` clock. It can still be
+    positive for a chain whose accumulated length is NOT on that clock - a
+    'latent' input spliced in from outside - and then the window is pushed back
+    to the group boundary below the piece and the caller drops the row(s)
+    covering the ``lead`` frames that predate it (``tokens_for_frames(lead)`` -
+    exactly what they occupy, and always congruent to the piece's own first row
+    modulo 5).
+
+    The window's LENGTH is a grid quantity too, and for the same reason: the
+    video VAE only yields rows for WHOLE 17-frame groups (``video_latent_t``
+    floors the count to the largest ``17m + 5`` at or below the frames it was
+    handed), so a window of ``lead + total`` frames loses the partial group at
+    its END - the caller would assume ``tokens_for_frames(lead + total) -
+    tokens_for_frames(lead)`` rows for a piece of ``tokens_for_frames(total)``
+    rows, receive fewer, and leave the piece's LAST rows with an EMPTY strip
+    (see the cross-check against the real ``video_latent_t`` in
+    mmh3_material_splice_test.py). Rounding the end UP to the next ``17m + 5``
+    settles it: the extra frames come from the same source, the rows they add
+    are dropped by _freeze_material's own clamp, and the delivered row count is
+    then provably >= the piece's. `total` is ``5 (mod 17)`` on every chain, so
+    this changes nothing whenever ``lead`` is 0 - i.e. on every chain whose
+    accumulated length sits on the usual ``17k + 5`` clock."""
+
+    a0 = max(0, int(cum) - int(tail_real))
+    start = a0 - (a0 % 17)
+    lead = a0 - start
+    total = max(0, int(total))
+    count = lead + total
+    if total > 0 and count % 17 != 5:
+        count += (5 - count % 17) % 17
+    return start, count, lead
+
+
+def _material_record(raw):
+    """Defensive read of ONE segment's 'direct reference in frame' record.
+
+    The editor (_sanitize_material in temporal_tile_editor.py) is the single
+    source of truth for this shape and already normalized it - this is the same
+    normalization applied a second time, because the config dict travels (and
+    can be replayed from) places the editor does not control: a snapshot written
+    by an older build, or a hand-made config. Mirrored on purpose, and pinned by
+    a test that runs BOTH through one table of inputs (see
+    mmh3_material_splice_test.py), so the two copies cannot drift.
+
+    'off' means this segment does not use the mode - the field is its switch,
+    so it is the one thing every consumer of this record tests first.
+    'cut_at_split' is the second switch and the only one that changes WHEN the
+    strip is there: off (the default) keeps it for the whole schedule, on drops
+    it at the HIGH -> LOW handoff (see material_cut)."""
+    if not isinstance(raw, dict):
+        raw = {}
+    side = raw.get("side", "off")
+    if side not in MATERIAL_SIDES:
+        side = "off"
+    try:
+        expose = int(raw.get("expose", 32))
+    except (TypeError, ValueError):
+        expose = 32
+    expose = max(0, round(expose / 32) * 32)
+    cut = raw.get("cut_at_split", False)
+    if isinstance(cut, str):
+        cut = cut.strip().lower() in ("1", "true", "yes", "on")
+    else:
+        # exactly the boolean: the js mirror tests `=== true`, and a table-
+        # driven test runs all three copies through one input table
+        cut = cut is True
+    return {"side": side, "expose": expose, "cut_at_split": cut}
+
+
+def material_geometry(side, expose_px, w_gen, h_gen, src_w, src_h):
+    """Pixel + latent geometry of the 'direct reference in frame' strip
+    (None = nothing spliced).
+
+    The chain's SAMPLING CANVAS of one segment can carry a strip of a second
+    video spliced along one edge and pinned by the video noise-mask, so the
+    model only GENERATES the remaining area while seeing the strip as
+    pixel-exact conditioning (the hand-built "splice the dancing clip next to
+    an empty latent" workflow, brought into the node). The canvas is a
+    SCAFFOLD: it exists for the duration of one segment's sampling and is cut
+    back down to the generation area afterwards (see _expand_canvas /
+    _crop_canvas), so nothing of it survives into the chain. The strip shares
+    the generation area's extent on the axis it is spliced ALONG (one latent
+    grid means ONE H for a left/right strip, one W for a top/bottom one) and
+    takes its own extent on the other axis from the SOURCE's aspect ratio,
+    rounded to CANVAS_MULTIPLE so the whole canvas stays on the DiT's 32 px
+    grid (the +/-16 px of rounding is what _resize's centre crop absorbs - no
+    aspect distortion). W/H therefore keeps meaning "the area that is
+    generated", exactly what they meant before the feature existed.
+
+    `side` is where the strip sits relative to the generation area, and it is
+    PER SEGMENT (it is the segment's own switch - 'off' means 'no strip here'),
+    because each segment builds and discards its own canvas.
+    `expose_px` is per segment too: it is how wide the FREE band at the seam is
+    - the band always lies on the SEAM, on the strip's side, because the
+    strip's outer edge has nothing to blend into - and each segment blends its
+    OWN seam, so the band is a property of the piece, not of the canvas.
+
+    Returns pixel sizes, the latent-axis indices and the frozen / free index
+    ranges along that axis (the callers turn them into a mask or a slice)."""
+    if side not in ("left", "right", "top", "bottom"):
+        return None
+    if not src_w or not src_h or src_w <= 0 or src_h <= 0:
+        return None
+    w_gen = max(CANVAS_MULTIPLE, int(w_gen))
+    h_gen = max(CANVAS_MULTIPLE, int(h_gen))
+    vertical = side in ("top", "bottom")
+    if vertical:
+        mw = w_gen
+        mh = max(CANVAS_MULTIPLE, round((w_gen * src_h / src_w)
+                                       / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+        total_w, total_h = w_gen, h_gen + mh
+        mat_lat, gen_lat = mh // 16, h_gen // 16
+    else:
+        mh = h_gen
+        mw = max(CANVAS_MULTIPLE, round((h_gen * src_w / src_h)
+                                        / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+        total_w, total_h = w_gen + mw, h_gen
+        mat_lat, gen_lat = mw // 16, w_gen // 16
+    total_lat = (total_h if vertical else total_w) // 16
+    before = side in ("left", "top")
+    lo = 0 if before else gen_lat
+    # the band can never swallow the whole strip: at least one token column of
+    # material stays pinned (an entirely free strip is not a strip at all)
+    band = max(0, min(int(expose_px) // 16, mat_lat - 2))
+    if before:
+        frozen, freeband = (lo, lo + mat_lat - band), (lo + mat_lat - band,
+                                                       lo + mat_lat)
+    else:
+        frozen, freeband = (lo + band, lo + mat_lat), (lo, lo + band)
+    return {
+        "side": side, "vertical": vertical, "before": before,
+        "mat_w": mw, "mat_h": mh, "total_w": total_w, "total_h": total_h,
+        "gen_w": w_gen, "gen_h": h_gen,
+        "mat_lat": mat_lat, "gen_lat": gen_lat, "total_lat": total_lat,
+        "lo": lo, "band": band, "frozen": frozen, "free": freeband,
+    }
+
+
+def material_stage_size(geo, w, h):
+    """The pixel size a segment's DiT stages are built for: its own sampling
+    canvas when it splices a strip, the generation area otherwise.
+
+    ONE question, one answer, asked by everything that has to agree with the
+    latent the model is about to see - above all the conditioning (a segment's
+    keyframes are frozen frames of the TARGET's grid, see material_cut) and the
+    control window. The sampling loop asks it per segment, and Phase A - which
+    hoists the conditioning of every hoistable segment to before the loop -
+    must ask the SAME one, or a hoisted segment would be encoded for a
+    different canvas than the piece it is sampled with."""
+    if geo is None:
+        return w, h
+    return int(geo["total_w"]), int(geo["total_h"])
+
+
+def _control_frames(buf, src_fps, out_len, fallback=None):
+    """Raw uint8 frames -> exactly ``out_len`` frames on the chain's 24 fps
+    clock, matching MiniMaxH3FunControlPatch._fit_frames' degradation.
+
+    The source is first put on the 24 fps clock by nearest frame (a 30 fps
+    source keeps one frame in 1.25), and the result is then CLAMPED to
+    ``out_len``: a source shorter than the segment FREEZES its last frame,
+    a longer one is truncated. Deliberately NOT a uniform stretch - a source's
+    timing has to stay truthful, so a 2 s video in a 4 s segment holds its last
+    frame instead of playing at half speed (which would drag the generated
+    motion along with it).
+
+    ``fallback`` is the same rule's other half: a raw uint8 frame (same form as
+    the ones in ``buf``) to hold when the window has NO frame of its own at all
+    - it starts past the source's end, see _pad_unreachable, which passes the
+    source's LAST frame. A window the source only PARTLY covers needs no
+    fallback: the last frame in its own ``buf`` already IS the source's last
+    frame."""
+    import numpy as np
+    if out_len <= 0:
+        return None
+    n = len(buf)
+    if n == 0:
+        if fallback is None:
+            return None
+        buf, n = [fallback], 1
+    step = float(src_fps) / 24.0 if src_fps and src_fps > 0 else 1.0
+    m = max(1, int(math.floor(n / step))) if step > 0 else n
+    src_idx = np.clip(np.round(np.arange(m) * step).astype(np.int64), 0, n - 1)
+    # A source FASTER than 24 fps rounds its last sampling step DOWN, so the
+    # slots stop one step short of the buffer's own last frame (30 fps, 26
+    # frames: 20 slots sample source frames 0..24). The clamp below must still
+    # be able to reach frame 25: "the source ran out" means the video's LAST
+    # frame - the same content a window past the end is filled with
+    # (_pad_unreachable), and the same frame the native _fit_frames holds (its
+    # indices clamp at frames.shape[0] - 1 with no fps conversion at all). The
+    # extra entry is only reached when the window outlives the source, and it
+    # keeps the sequence monotone (24 -> 25 -> 25 ...).
+    if src_idx[-1] != n - 1:
+        src_idx = np.append(src_idx, n - 1)
+        m += 1
+    out_idx = np.clip(np.arange(int(out_len)), 0, m - 1)
+    arr = np.stack([buf[i] for i in src_idx[out_idx]], axis=0)
+    return torch.from_numpy(arr.astype(np.float32) / 255.0)
+
+
+def _decode_control_windows(video_obj, windows, pad_last=False, padded=None):
+    """Decode a ComfyUI VIDEO for a set of control windows in ONE pass.
+
+    ``windows`` is an iterable of ``(key, t0_sec, t1_sec, out_len)`` - the same
+    shape _auto_crop_video_frames takes, but this variant also accepts
+    OVERLAPPING windows, which fun-control slices inherently are: a segment's
+    slice starts one carried tail before the previous segment's slice ends, so
+    one source frame can belong to two windows. (_auto_crop_video_frames cannot
+    be reused: it finalizes a window the moment a frame passes its end, so any
+    window whose start lies before that point would be handed an empty buffer.)
+    Only frames inside some window are held, but ALL windows' frames live at
+    once - the same trade-off the reference-video path already makes. Returns
+    ``{key -> [out_len, H, W, 3] tensor (0..1) | None}``; None = the source
+    holds no decodable frame at all.
+
+    ``pad_last`` decides what a window the source cannot REACH gets (it starts
+    past the video's end). False: an empty result, None - the fun-control plan
+    picks this, because its policy for a control video that ends early is to
+    run that segment WITHOUT control and say so. True: the source's LAST frame
+    held for the whole window, i.e. the rule _control_frames already applies
+    when the source ends INSIDE a window (see _pad_unreachable) - the strip's
+    windows pick this: the chain runs on the source's clock, so a short source
+    must not blank a segment out. The keys filled that way are appended to the
+    optional ``padded`` list, so the caller can report them."""
+    import av
+    if not windows:
+        return {}
+    windows = list(windows)
+    keys = [w[0] for w in windows]
+    results = {k: None for k in keys}
+    bufs = {k: [] for k in keys}
+    done = {k: False for k in keys}
+    order = sorted(range(len(windows)), key=lambda j: windows[j][1])
+    source = video_obj.get_stream_source()
+    with av.open(source) as container:
+        vstream = container.streams.video[0]
+        src_fps = None
+        try:
+            _r = video_obj.get_frame_rate()
+            if _r and _r > 0:
+                src_fps = float(_r)
+        except Exception:
+            src_fps = None
+        if not src_fps:
+            _r = vstream.average_rate or (
+                vstream.frames / vstream.duration if vstream.duration else None)
+            if _r:
+                src_fps = float(_r)
+        if not src_fps or src_fps <= 0:
+            src_fps = 24.0
+        left = len(windows)
+        # the frame the padding fallback uses - see _pad_unreachable. Only ever
+        # non-None when a window stayed open to EOF, i.e. when it is needed.
+        last = None
+        for frame in container.decode(video=0):
+            last = frame
+            ts = float(frame.time) if frame.time is not None else -1.0
+            arr = None
+            for j in order:
+                key = keys[j]
+                if done[key]:
+                    continue
+                w0, w1, out_len = windows[j][1], windows[j][2], windows[j][3]
+                if ts < w0:
+                    continue
+                if ts >= w1:
+                    results[key] = _control_frames(bufs[key], src_fps, out_len)
+                    bufs[key] = []
+                    done[key] = True
+                    left -= 1
+                    continue
+                if arr is None:
+                    try:
+                        arr = frame.to_ndarray(format="rgb24")
+                    except Exception:
+                        break
+                bufs[key].append(arr)
+            if not left:
+                break
+        for j in order:
+            key = keys[j]
+            if not done[key]:
+                results[key] = _control_frames(bufs[key], src_fps,
+                                               windows[j][3])
+        if pad_last:
+            _pad_unreachable(results, windows, src_fps, last, padded)
+    return results
+
+
+def _video_dimensions(video_obj):
+    """(width, height) of a ComfyUI VIDEO, or None.
+
+    A VIDEO is a FILE handle, so the metadata read is cheap; the fallback
+    decodes a single frame (some sources report no dimensions without being
+    opened). Only the canvas-material geometry needs this - the strip's own
+    extent comes from the source's aspect ratio."""
+    try:
+        d = video_obj.get_dimensions()
+        if d and len(d) == 2 and int(d[0]) > 0 and int(d[1]) > 0:
+            return int(d[0]), int(d[1])
+    except Exception:
+        pass
+    try:
+        got = _decode_control_windows(video_obj, [("probe", 0.0, 0.5, 1)])
+        fr = got.get("probe")
+        if fr is not None and int(fr.shape[0]) > 0:
+            return int(fr.shape[2]), int(fr.shape[1])
+    except Exception:
+        pass
+    return None
+
+
+def _slice_control_mask(mask, start, n):
+    """``n`` frames of a ComfyUI MASK (``[T, H, W]``, or ``[H, W]``) starting at
+    absolute chain frame ``start`` - CLAMPED at both ends, never resampled.
+
+    A mask is already on the chain's clock, so there is nothing to convert; the
+    clamp is what turns a single mask frame into the native node's "one static
+    mask for every frame" behaviour and what keeps the mask aligned with the
+    control video's window (sliced on the very same ``[start, start + n)``
+    numbers). Returns None when there is no usable mask."""
+    if mask is None or not hasattr(mask, "shape") or not hasattr(mask, "dim"):
+        return None
+    if mask.dim() == 2:
+        mask = mask.unsqueeze(0)
+    if mask.dim() != 3 or not int(mask.shape[0]):
+        return None
+    total = int(mask.shape[0])
+    idx = torch.arange(max(0, int(n)), device=mask.device) + int(start)
+    return mask[idx.clamp(0, total - 1)]
+
+
+def _has_fun_control_wrapper(model):
+    """True when ``model`` already carries a MiniMaxH3FunControlPatch wrapper.
+
+    That only happens when the user ALSO wired the native 'Apply MiniMax H3
+    Fun ControlNet' node in front of 'MMH3 Sample Params'. ModelPatcher.clone()
+    copies wrappers, so every clone this node makes for its per-segment patches
+    would inherit it: the control would run TWICE, and the inherited copy would
+    still use the whole control video from frame 0 (the native _fit_frames
+    always starts at index 0) instead of the segment's slice. Worth a loud
+    warning - it cannot be un-registered from the outside."""
+    try:
+        from comfy_extras.nodes_minimax_h3 import MiniMaxH3FunControlPatch
+        import comfy.patcher_extension
+    except Exception:
+        return False
+    try:
+        entries = (model.wrappers or {}).get(
+            comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, {})
+    except Exception:
+        return False
+    for lst in (entries or {}).values():
+        for fn in (lst or ()):
+            if isinstance(getattr(fn, "__self__", None),
+                          MiniMaxH3FunControlPatch):
+                return True
+    return False
+
+
+def _video_audio_as_bgm(video_obj):
+    """The audio track of a ComfyUI VIDEO input as an AudioDict - the same
+    {"waveform": [1, C, L] (0..1-ish float), "sample_rate": int} shape the
+    'audio_BGM' socket delivers - or None when the video has no decodable audio
+    stream. Mono is upmixed to stereo; the Extend dance to the audio VAE's own
+    rate happens later in _bgm_vae_waveform just like for a picked BGM file."""
+    import av
+    import numpy as np
+    source = video_obj.get_stream_source()
+    with av.open(source) as container:
+        astream = next((s for s in container.streams if s.type == "audio"), None)
+        if astream is None:
+            return None
+        sr = int(astream.sample_rate or 0)
+        got = []
+        for f in container.decode(astream):
+            got.append(f.to_ndarray(format="fltp"))          # [C, L] float32
+        if not got:
+            return None
+    wave = np.concatenate(got, axis=1) if len(got) > 1 else got[0]   # [C, L]
+    if wave.ndim == 1:
+        wave = wave[None, :]
+    if wave.shape[0] == 1:
+        wave = np.repeat(wave, 2, axis=0)                    # upmix mono -> stereo
+    return {"waveform": torch.from_numpy(np.ascontiguousarray(wave[None])),
+            "sample_rate": sr}
+
+
 def _save_h3latent(path, samples):
     """Save an H3 AV latent (NestedTensor video+audio) in the
     comfyui-minimax-h3-latent '.h3latent' safetensors format."""
@@ -607,7 +1220,12 @@ def _find_session_file(sdir, name, fallback_sub=None):
 
 # v2: the FL2VA first frame is centre cover-cropped instead of stretched, so
 # the same source image now produces a different latent.
-CACHE_FORMAT = 2
+# v3: a hard cut realizes the smallest legal seam (5 frames) instead of a tail
+# of 0, which moves where a piece begins inside its 'direct reference in frame'
+# strip window - the same window now encodes to a different strip; every strip
+# window's length is additionally rounded up to the 17-frame group grid (see
+# material_window). Both change what gets encoded from unchanged inputs.
+CACHE_FORMAT = 3
 
 _COND_META_KEY = "mmh3_cond"
 _TENSOR_TAG = "__tensor__"
@@ -1052,7 +1670,8 @@ def _encode_text(clip, prompt):
 
 def _build_ref2va_full(clip, vae, audio_vae, prompt, w, h, frame_count,
                        ref_images, ref_image_size="match",
-                       ref_video=None, ref_video_audio=None, ref_audio=None,
+                       ref_video=None, ref_video_frames=None,
+                       ref_video_audio=None, ref_audio=None,
                        latent_refs=None, extra_video_refs=None,
                        latent_audio_refs=None, cache=None, src=None):
     """Full MiniMaxH3ReferenceToVideo-style reference conditioning.
@@ -1116,9 +1735,16 @@ def _build_ref2va_full(clip, vae, audio_vae, prompt, w, h, frame_count,
                                                     (w, h, ref_image_size),
                                                     lambda: vae.encode(resized))})
 
-    # 2) reference video (+ optional index-paired soundtrack)
-    if ref_video:
+    # 2) reference video (+ optional index-paired soundtrack). `ref_video` is
+    # a file name (loaded at 24 fps); `ref_video_frames` is an already-loaded
+    # [N,H,W,3] tensor (an 'auto crop input ref' slice). Exactly one is given.
+    if ref_video_frames is not None:
+        vid = ref_video_frames
+    elif ref_video:
         vid = _load_input_video_frames(ref_video)          # [N, H, W, 3] @24fps
+    else:
+        vid = None
+    if vid is not None:
         vh, vw = vid.shape[1], vid.shape[2]
         cw, ch = adapt_canvas(vw, vh)
         if vw * vh < cw * ch:
@@ -1130,7 +1756,8 @@ def _build_ref2va_full(clip, vae, audio_vae, prompt, w, h, frame_count,
         n = frames.shape[0]
         if n < 5:
             raise ValueError(
-                f"ref video '{ref_video}' needs at least 5 frames (~0.2s at 24 fps)")
+                f"reference video needs at least 5 frames (~0.2s at 24 fps); "
+                f"got {n}")
         while n % 17 != 5:
             n -= 1
         frames = frames[:n]
@@ -1263,7 +1890,9 @@ def _ref_src(seg, ref_ids):
     return {
         "images": ref_ids,
         "video": _file_source_id(seg["ref_video"])
-                 if seg.get("ref_video") else None,
+                 if seg.get("ref_video") else
+                 (_tensor_source_id(seg["ref_video_frames"])
+                  if seg.get("ref_video_frames") is not None else None),
         "video_audio": _file_source_id(seg["ref_video_audio"])
                        if seg.get("ref_video_audio") else None,
         "audio": _file_source_id(seg["ref_audio"])
@@ -1385,6 +2014,7 @@ def _build_first_conditioning(clip, vae, audio_vae, seg, w, h, frames,
 
     sock_imgs = _sock_refs(seg, sock_pool)
     if seg["mode"] == "Ref2VA" and (seg["ref_images"] or seg.get("ref_video")
+                                    or seg.get("ref_video_frames") is not None
                                     or seg.get("ref_audio") or sock_imgs):
         loaders, ref_ids = _ref_image_plan(seg, sock_pool)
         src = _ref_src(seg, ref_ids)
@@ -1399,6 +2029,7 @@ def _build_first_conditioning(clip, vae, audio_vae, seg, w, h, frames,
             clip, vae, audio_vae, seg["prompt"], w, h, frames, refs,
             seg.get("ref_image_size", "match"),
             ref_video=seg.get("ref_video") or None,
+            ref_video_frames=seg.get("ref_video_frames"),
             ref_video_audio=seg.get("ref_video_audio") or None,
             ref_audio=seg.get("ref_audio") or None,
             cache=cache, src=src)
@@ -1541,6 +2172,7 @@ def _build_continue_conditioning(clip, vae, audio_vae, seg, w, h, frames,
             cache.save_cond(key, pos)
     elif seg["mode"] == "Ref2VA" and (seg["ref_images"] or
                                       seg.get("ref_video") or
+                                      seg.get("ref_video_frames") is not None or
                                       seg.get("ref_audio") or
                                       seg["ref_source"] == "prev_frame" or
                                       latent_audio_refs or
@@ -1578,6 +2210,7 @@ def _build_continue_conditioning(clip, vae, audio_vae, seg, w, h, frames,
             clip, vae, audio_vae, seg["prompt"], w, h, frames, refs,
             seg.get("ref_image_size", "match"),
             ref_video=seg.get("ref_video") or None,
+            ref_video_frames=seg.get("ref_video_frames"),
             ref_video_audio=seg.get("ref_video_audio") or None,
             ref_audio=seg.get("ref_audio") or None,
             latent_refs=latent_refs,
@@ -1783,7 +2416,7 @@ class MMH3TemporalOverlapParams(io.ComfyNode):
                                default="none",
                                tooltip="Seam continuity WITHOUT fade: 'prev_tail' feeds the previous merged video's tail to every continuation segment as a bit-perfect latent video reference - WITH its soundtrack (the tail's audio latent rides along, kind 'video_audio') - through the native Ref2VA mechanism. No soft noise-mask involved, so no mosaic artifacts. Recommended with fade_frames=0 and a generous per-segment 'overlap frames' setting."),
                 io.Int.Input("seam_ref_frames", default=0, min=0, max=1020, step=17,
-                             tooltip="How many pixel frames of the previous merged video the seam reference covers, snapped to the 17m+5 grid (5, 22, 39, ...). 0 = the entire carried tail (the segment's overlap frames). Ignored when seam_reference is 'none'."),
+                             tooltip="How many pixel frames of the previous merged video the seam reference covers. A value above 0 is a REQUEST: it is snapped to the NEAREST 17m+5 grid point (5, 22, 39, ...) and is never longer than the video accumulated so far. The box itself steps in 17s from 0 (0, 17, 34, ...), so its own numbers are NOT grid points - 17 = 22 frames, 34 = 39, 51 = 56 - and a grid value can simply be typed in (39 asks for exactly 39 frames). 0 = the entire carried tail (the segment's overlap frames). Ignored when seam_reference is not 'prev_tail', and on a hard cut (overlap frames = 0)."),
                 io.Combo.Input("overlap_mode", options=["later", "earlier"], default="later",
                                tooltip="Who wins the overlap band: 'later' = the new segment, 'earlier' = the accumulated video."),
                 io.Combo.Input("overlap_blend", options=["linear", "smoothstep", "midpoint", "overwrite"],
@@ -1946,6 +2579,60 @@ class MMH3TemporalExtendVideo(io.ComfyNode):
                                 tooltip="OPTIONAL fully-sampled H3 AV latent to continue from. When connected together with resume_from_segment=0, segment 0 EXTENDS this latent instead of starting fresh; with resume > 0 the session's stored merged latent is used and this input is ignored."),
                 REF_IMAGES.Input("ref_image_slots", optional=True,
                                  tooltip="OPTIONAL reference images wired into the 'MMH3 Temporal Tile Editor' (its 'ref_image_slots' output): one record per connected socket at its NATIVE resolution, in slot order. Every segment uses them as 'load images' references except for the sockets it ruled out in the editor, each sized by that segment's 'reference image size' ('match' / 'max', aspect preserved) - the exact same path as the files picked in the dock panel. 'First_or_Ref_Image_0' / 'Last_or_Ref_Image_1' also serve as segment 0's FL2VA first/last frame when no file is picked for them. One socket is one '<Picture i>': a socket fed by a batch contributes its FIRST image only (the MiniMaxH3 Reference to Video convention). Unconnected = only the editor's picked files are used."),
+                io.ModelPatch.Input("controlnet", optional=True,
+                                    tooltip="OPTIONAL MiniMax H3 Fun ControlNet "
+                                            "model patch (the same object "
+                                            "'Model Patch Loader' produces for "
+                                            "the native 'Apply MiniMax H3 Fun "
+                                            "ControlNet' node). It is applied "
+                                            "PER SEGMENT on a per-segment "
+                                            "SLICE of the Tile Editor's "
+                                            "'fun_control_video': the native "
+                                            "patch always starts at the control "
+                                            "video's frame 0, so every segment "
+                                            "would otherwise be controlled by "
+                                            "the opening frames. This node "
+                                            "builds a fresh patch instance per "
+                                            "segment (the native shape-keyed "
+                                            "control-latent cache would "
+                                            "otherwise feed one segment's "
+                                            "window to the next) and mounts it "
+                                            "on the HIGH, LOW and second-pass "
+                                            "models alike - a second pass "
+                                            "without control would re-render "
+                                            "the controlled content freely. "
+                                            "IMPORTANT: do NOT also wire the "
+                                            "native 'Apply MiniMax H3 Fun "
+                                            "ControlNet' node in front of "
+                                            "'sample_params' - the patch would "
+                                            "be inherited by every clone and "
+                                            "applied twice; this node warns "
+                                            "when it detects that. Unconnected "
+                                            "= segments whose fun-control mode "
+                                            "is not 'off' are rejected."),
+                CONTROL_SLOTS.Input("control_image_slots", optional=True,
+                                    tooltip="OPTIONAL fun-control assets from "
+                                            "the 'MMH3 Temporal Tile Editor' "
+                                            "(its 'control_image_slots' "
+                                            "output): the chain-wide "
+                                            "'fun_control_video' plus the "
+                                            "optional inpaint 'fun_control_mask' "
+                                            "/ 'fun_control_source_video'. "
+                                            "Nothing is decoded by the editor - "
+                                            "this node slices each controlled "
+                                            "segment's window out of the VIDEO "
+                                            "(its carried tail included) and "
+                                            "encodes that slice as the "
+                                            "segment's control hint, so the "
+                                            "signal stays continuous across the "
+                                            "chain instead of restarting at the "
+                                            "control video's first frame. A "
+                                            "control-source mismatch is "
+                                            "reported in the console: a control "
+                                            "window starting past the video's "
+                                            "end drops that segment's control "
+                                            "(with a warning) rather than "
+                                            "failing the run."),
             ],
             outputs=[
                 io.Latent.Output("merged_latent",
@@ -1961,7 +2648,9 @@ class MMH3TemporalExtendVideo(io.ComfyNode):
     def execute(cls, temporal_tile_config, sample_params, clip, vae,
                 audio_vae=None, latent_seg_0=None, overlap_params=None,
                 second_sample_params=None, second_pass_audio="second",
-                ref_image_slots=None, **kwargs) -> io.NodeOutput:
+                ref_image_slots=None,
+                controlnet=None, control_image_slots=None,
+                **kwargs) -> io.NodeOutput:
         # The socket is named '2nd_sample_params' (not a valid Python
         # identifier), so ComfyUI hands it over via **kwargs - map it here.
         if second_sample_params is None:
@@ -1973,6 +2662,30 @@ class MMH3TemporalExtendVideo(io.ComfyNode):
         if not segs:
             raise ValueError("temporal_tile_config carries no segments - connect an "
                              "MMH3 Temporal Tile Editor and add at least one segment")
+        # ── the chain's stop point ('mute'): the SECOND gate ──
+        # The Tile Editor already drops the closed tail while it builds this
+        # config, so `mute_from_segment` normally arrives equal to len(segs)
+        # and the lines below are a no-op. They are here ANYWAY, because this
+        # is the node that actually BUILDS conditioning: Phase A pre-encodes
+        # every hoistable segment before the sampling loop, and a config that
+        # carries a stop point TOGETHER WITH the segments behind it - a
+        # hand-written one, or one from an older editor - must not make the
+        # text encoder / VAE work on segments this run will not sample. The
+        # closed tail is dropped here, before anything at all is derived from
+        # the chain (the cumulative frame counts, the auto-crop / bgm / fun
+        # control windows and every material record all read `segs`).
+        stop = _mute_stop(cfg, len(segs))
+        if stop == 0:
+            raise ValueError(
+                "every segment is closed (mute): segment 0 is the chain's stop "
+                "point, so there is nothing to sample - unmute a segment in "
+                "the MMH3 Temporal Tile Editor.")
+        if 0 < stop < len(segs):
+            print(f"[MMH3-TemporalExtend] mute: the chain stops before segment "
+                  f"{stop} - ignoring segment(s) {stop}..{len(segs) - 1} from "
+                  "the config: nothing is conditioned, encoded or sampled for "
+                  "them in this run.")
+            segs = segs[:stop]
         ext = cfg.get("extend_params", {})
         # chain-wide continuation parameters: Tile Editor globals, overridden
         # by the MMH3 Temporal Overlap Params / Overlap Simple sub-node when
@@ -2067,6 +2780,37 @@ class MMH3TemporalExtendVideo(io.ComfyNode):
         first = segs[0]
         W = int(first.get("width", 768))
         H = int(first.get("height", 768))
+
+        # ── direct reference in frame: the strip is a SAMPLING SCAFFOLD ──
+        # It is laid out only for the segments that ask for it, only for the
+        # duration of that segment's own sampling, and it is CUT BACK OFF the
+        # moment the segment has been sampled (see _splice_material /
+        # _crop_canvas in the loop): the model may look at the reference while
+        # it generates, but nothing of it survives into the piece that gets
+        # stitched, stored, previewed or handed to the next segment. Every
+        # latent this node carries on the chain is therefore the GENERATION
+        # AREA - W/H, the one geometry that IS chain-wide, because the picture
+        # that gets concatenated along time is the generated one.
+        # Consequences, all deliberate:
+        #  * 'side' == 'off' is that segment's switch, and it is PER SEGMENT:
+        #    nothing about the canvas is shared any more, so two segments may
+        #    splice along different edges (or different strip sizes) freely.
+        #  * a LOCKED segment's record is dead weight - it will never be read
+        #    again - so every check below is scoped to mat_segs (the segments
+        #    that actually re-sample, contrast the bgm / fun-control scoping).
+        #  * adopting a carried latent's resolution cannot move the strip any
+        #    more, because the strip is placed relative to the piece being
+        #    built right now, not to the chain.
+        mat_recs = [_material_record(s.get("material")) for s in segs]
+        mat_segs = [i for i, r in enumerate(mat_recs)
+                    if i >= resume and r["side"] != "off"]
+        mat_geo = None
+        mat_geo_of = {}
+
+        # ── the chain's resolution is the carried latent's own ──
+        # Resolved BEFORE the strip geometry: the strip is laid out on the
+        # generation area, and the generation area is whatever the piece will
+        # really be built at.
         if merged_v is not None:
             # a carried latent defines the chain resolution - the first
             # segment's configured size must match or the stitch breaks
@@ -2077,6 +2821,78 @@ class MMH3TemporalExtendVideo(io.ComfyNode):
                       f"carried latent's resolution")
                 W = merged_v.shape[4] * 16
                 H = merged_v.shape[3] * 16
+        if mat_segs:
+            mat_src = cfg.get("ref_video_input")
+            if mat_src is None:
+                # scoped like every other whole-chain material check: a LOCKED
+                # segment's record is never read again, so it cannot demand a
+                # source (contrast the ref-video auto-crop guard, which is
+                # scoped for the same reason)
+                raise ValueError(
+                    f"segment(s) {mat_segs} use 'direct reference in frame', but "
+                    "the Tile Editor's 'ref_video_input' socket is not "
+                    "connected - that socket carries the reference video. "
+                    "Connect a VIDEO source there, or set those segments' "
+                    "splice side back to 'off'.")
+            _dims = _video_dimensions(mat_src)
+            if _dims is None:
+                raise ValueError(
+                    "the 'direct reference in frame' source video reports no "
+                    "pixel dimensions, so the strip's width/height (which "
+                    "follow its aspect ratio) cannot be computed.")
+            # The strip and an 'auto crop input ref' reference video would
+            # both claim the SAME socket, and they mean different things (a
+            # canvas region vs. a reference block) - the two cannot coexist on
+            # one wire, so this is an error rather than a silent pick.
+            _clash = [i for i in mat_segs
+                      if segs[i].get("ref_video_mode") == "auto_crop"]
+            if _clash:
+                raise ValueError(
+                    f"segment(s) {_clash} both use 'direct reference in frame' "
+                    "and take their reference video from the 'ref_video_input' "
+                    "socket ('auto crop input ref'). That socket carries ONE "
+                    "video: pick one role per segment - switch the ref-video "
+                    "mode back to 'load' (its file picker is unaffected) or set "
+                    "the splice side back to 'off'.")
+            # W/H are the GENERATION area; each sampled segment gets its OWN
+            # canvas from its own record - the side may differ between
+            # segments, and so may the strip's size (the source is one video,
+            # but the strip's extent follows the generation area it is laid
+            # on). The free band is per segment for a second reason: the seam
+            # that band has to blend is the seam of THAT segment's piece.
+            for i in mat_segs:
+                g = material_geometry(mat_recs[i]["side"],
+                                      mat_recs[i]["expose"],
+                                      W, H, _dims[0], _dims[1])
+                if g is None:
+                    raise ValueError(
+                        f"direct reference in frame: cannot lay out a "
+                        f"'{mat_recs[i]['side']}' strip on a {W}x{H} "
+                        "generation area")
+                mat_geo_of[i] = g
+            mat_geo = mat_geo_of[mat_segs[0]]
+            _sampled = list(range(resume, len(segs)))
+            _off = [i for i in _sampled if i not in mat_segs]
+            if _off:
+                print(f"[MMH3-TemporalExtend] direct reference in frame: used "
+                      f"on segment(s) {mat_segs} and not on {_off} of the "
+                      f"sampled segments ({', '.join(str(x) for x in _sampled)})"
+                      " - those generate the plain generation area, so the "
+                      "reference only guides the segments that asked for it.")
+            for i in mat_segs:
+                g = mat_geo_of[i]
+                print(f"[MMH3-TemporalExtend] direct reference in frame: "
+                      f"segment {i} splices a {g['mat_w']}x{g['mat_h']} strip "
+                      f"at the {g['side']} of the {g['gen_w']}x{g['gen_h']} "
+                      f"generation area -> sampling canvas {g['total_w']}x"
+                      f"{g['total_h']} ({g['mat_lat']} "
+                      f"{'row' if g['vertical'] else 'column'}(s), {g['band']} "
+                      "token(s) of free band at the seam); the strip is cut "
+                      "back off after sampling")
+
+        # (the carried resolution was adopted above, before the strip geometry -
+        # with the strip cropped off there is nothing left that a carried
+        # canvas could disagree with)
 
         # ── reference sockets wired into the Tile Editor ──
         # One record per socket at its native resolution - the editor no
@@ -2120,7 +2936,7 @@ class MMH3TemporalExtendVideo(io.ComfyNode):
             "segments": [],
         }
 
-        def run_two_stage(piece, pos, neg, seed, tag, params=None):
+        def run_two_stage(piece, pos, neg, seed, tag, params=None, cut=None):
             sp = params if params is not None else sample_params
             noise = Noise_RandomNoise(int(seed))
             # EXPERIMENTAL 'qsample_init': bias the initial noise with the
@@ -2155,6 +2971,27 @@ class MMH3TemporalExtendVideo(io.ComfyNode):
                                      "(empty sigma schedule?)")
                 cont = dict(piece)
                 cont["samples"] = x0l
+                if cut is not None:
+                    # ── 'cut at the split': the strip dies at the handoff ──
+                    # The reference steered the HIGH stage - the structure is in
+                    # the latent now - and the detail stage finishes the picture
+                    # from the prompt alone. The cut is a change of the latent's
+                    # SIZE between two stages, so it is the last moment it can
+                    # happen (the state handed over is the only thing both
+                    # stages share) and the whole bundle has to move with it:
+                    # latent, noise-mask and keyframes (see material_cut).
+                    x0l, _cm, (pos, neg) = material_cut(
+                        cut, x0l, piece.get("noise_mask"), (pos, neg))
+                    cont["samples"] = x0l
+                    if _cm is not None:
+                        cont["noise_mask"] = _cm
+                    print(f"[MMH3-TemporalExtend] {tag} 'direct reference in "
+                          f"frame' cut at the split: the LOW stage samples the "
+                          f"{cut['gen_w']}x{cut['gen_h']} generation area alone "
+                          f"- the {cut['mat_w']}x{cut['mat_h']} strip and its "
+                          f"{cut['mat_lat']} frozen "
+                          f"{'row' if cut['vertical'] else 'column'}(s) drop "
+                          "out of the latent, the mask and the keyframes")
                 noise_low = Noise_RandomNoise(
                     (int(seed) + 1) & 0xFFFFFFFFFFFFFFFF)
                 print(f"[MMH3-TemporalExtend] {tag} LOW stage: HIGH x0 "
@@ -2163,6 +3000,31 @@ class MMH3TemporalExtendVideo(io.ComfyNode):
                                    noise_low, sp["sampler_low"],
                                    sl, neg, sp["cfg_low"])
             return seg
+
+        def _clone_control(model, patch):
+            """A clone of `model` carrying `patch`.
+
+            The clone is what keeps the ORIGINAL model (shared by the graph)
+            free of our patch: ModelPatcher.clone() deep-copies model_options
+            and copies the wrapper lists."""
+            m = model.clone()
+            patch.register(m)
+            return m
+
+        def _mount_control(sp, patch):
+            """A COPY of a sample-params bundle whose models are clones carrying
+            `patch` (None = the bundle itself).
+
+            A copy, because the bundle belongs to the graph and every later
+            segment re-mounts a different patch - mutating it in place would
+            leak one segment's control into the next."""
+            if patch is None:
+                return sp
+            out = dict(sp)
+            out["model_high"] = _clone_control(sp["model_high"], patch)
+            if sp.get("low_active") and sp.get("model_low") is not None:
+                out["model_low"] = _clone_control(sp["model_low"], patch)
+            return out
 
         def save_segment(i, seg_v, seg_a, merged_v, merged_a, info):
             try:
@@ -2312,10 +3174,18 @@ class MMH3TemporalExtendVideo(io.ComfyNode):
             base = prev_split_frame if prev_split_frame is not None \
                 else f_split
             if base is None:
-                tail = int(seg.get("overlap_frames")
-                           or glob.get("tail_frames", 39))
-                base = snap_split_frame(
-                    frames_for_tokens(merged_v.shape[2]), tail)[1]
+                tail = seg.get("overlap_frames")
+                if tail is None:
+                    tail = glob.get("tail_frames", 39)
+                tail = int(tail)
+                fcount = frames_for_tokens(merged_v.shape[2])
+                # This segment's seam, resolved exactly as
+                # _prepare_continuation resolves it - one helper, see
+                # seam_split. A hard cut is not a tail of 0 there either, so it
+                # still has a real (5-frame) boundary to anchor at. `or` would
+                # have read the 0 sentinel as "unset" and fallen back to the
+                # chain default.
+                base = seam_split(fcount, int(tail))[1]
             a0 = max(0, min(round(int(base) * FRAME_RESCALE), ta))
             if ta - a0 < 2:   # a useless sliver - treat as no reference
                 return []
@@ -2337,7 +3207,8 @@ class MMH3TemporalExtendVideo(io.ComfyNode):
         def _seg_ep(seg):
             ep = dict(glob)
             if seg.get("overlap_frames") is not None:
-                ep["tail_frames"] = snap_17n5(int(seg["overlap_frames"]))
+                ep["tail_frames"] = 0 if int(seg["overlap_frames"]) <= 0 \
+                                else snap_17n5(int(seg["overlap_frames"]))
             elif isinstance(seg.get("extend_params"), dict) and seg["extend_params"]:
                 ep.update(seg["extend_params"])
             return ep
@@ -2349,6 +3220,118 @@ class MMH3TemporalExtendVideo(io.ComfyNode):
         # counts off the 17n+5 grid, so tracking FRAMES would drift; tokens
         # are exact for any latent, including external ones)
         tv = (merged_v.shape[2] if merged_v is not None else None)
+
+        # ── absolute boundary of every segment on the chain's timeline ──
+        # The sum of the PRECEDING segments' new_frames: each segment adds
+        # exactly its own new_frames to the timeline (its carried tail is
+        # RE-covered, not prepended), so this holds for locked segments too and
+        # does not need any latent. The ref-video windows, the BGM slices and
+        # the fun-control slices all measure positions from here.
+        cum_of = []
+        _cum = 0
+        for s in segs:
+            cum_of.append(_cum)
+            _cum += int(s.get("new_frames", 0))
+        # fun-control slice per segment index: (start_frame, frame_count) on the
+        # chain timeline, filled in by the replay below (the same integer
+        # arithmetic the sampling loop performs) - see control_slice_window.
+        ctrl_win = {}
+        # canvas-material window per segment index: (start, count, lead) on the
+        # chain timeline - see material_window. It covers the piece exactly
+        # (carried tail and all: the sample of the piece DECODES those rows),
+        # but unlike a control latent the strip is an independently encoded
+        # video, so the window is anchored on the 17-frame group grid and the
+        # `lead` frames that predate the piece are dropped from the encode.
+        mat_win = {}
+
+        # ── reference video input ('auto crop input ref' ref-video mode) ──
+        # Analogous to 'bgm' (but VIDEO): every auto_crop segment takes the
+        # slice covering its ABSOLUTE span on the chain's timeline - the sum
+        # of the PRECEDING segments' new-frames decides where it starts, its
+        # own new-frames decide the length - so abutting slices reassemble
+        # the input video continuously. The input is a ComfyUI VIDEO object
+        # (a file - NOT a decoded frame tensor), so only each window's frames
+        # are decoded in one pass: no huge frame tensor is ever materialized
+        # (the whole reason this socket is a VIDEO and not an IMAGE sequence).
+        # Each segment's decoded [H,W,3] (0..1) frames become its
+        # `ref_video_frames`, handed to the conditioning builder as the
+        # segment's reference video. Timing is FPS-agnostic on the chain's
+        # 24 fps clock: the source is cropped by wall-clock seconds and
+        # resampled to 24 fps, so a non-24 fps source is converted here. A
+        # window the source cannot FILL holds its LAST frame (never stretched,
+        # never empty): the source is on the chain's own clock, so a video that
+        # ends inside a window - or before the window starts, i.e. the chain
+        # outran it - is held instead of the slice sliding or going missing.
+        # The 17m+5 frame-count constraint
+        # of a reference video is handled below in _build_ref2va_full, which
+        # truncates to frame_count and snaps to the 17m+5 grid exactly like a
+        # loaded file - see its reference-video branch. This must run BEFORE
+        # the Phase-A pre-encode loop (and the sampling loop) so those read
+        # seg["ref_video_frames"].
+        # Only segments from `resume` on are sampled (or re-sampled) in this
+        # run, and a LOCKED segment already consumed the reference video its
+        # sampling used: its conditioning is never rebuilt, so a stale
+        # 'auto crop input ref' mode left behind on a finished segment must
+        # NOT demand the socket. Scoped exactly like the 'bgm' audio mode
+        # below (segs[resume:]) - otherwise a chain whose auto-crop segments
+        # are all locked fails while the run needs no ref-video input at all.
+        auto_crop_idxs = [i for i, s in enumerate(segs)
+                          if s.get("ref_video_mode") == "auto_crop"
+                          and i >= resume]
+        if auto_crop_idxs:
+            ref_video_input = cfg.get("ref_video_input")
+            if ref_video_input is None:
+                raise ValueError(
+                    "ref-video mode 'auto crop input ref' reads the video "
+                    "from the 'ref_video_input' socket of the MMH3 Temporal "
+                    "Tile Editor, which is not connected. Connect a VIDEO "
+                    "source there, or switch those segments' ref-video mode "
+                    "to 'load'.")
+            cum = 0
+            # cumulative preceding new_frames: continuous concatenation
+            for i, s in enumerate(segs):
+                nf = int(s.get("new_frames", 0))
+                s["_auto_crop_start"] = cum
+                cum += nf
+            # One window per auto-crop segment, on the chain's FPS-agnostic
+            # CLOCK (24 fps): the segment's absolute time span is
+            # [_auto_crop_start/24, (_auto_crop_start+new_frames)/24) seconds,
+            # and its reference video is that window of the source,
+            # resampled to `new_frames` frames @24. This keeps slices continuous
+            # across segments and converts any non-24 fps source here.
+            windows = [(i, int(segs[i]["_auto_crop_start"]) / 24.0,
+                        (int(segs[i]["_auto_crop_start"]) +
+                         int(segs[i].get("new_frames", 0))) / 24.0,
+                        int(segs[i].get("new_frames", 0)))
+                       for i in auto_crop_idxs]
+            ac_pad = []
+            sliced_map = _auto_crop_video_frames(ref_video_input, windows,
+                                                 padded=ac_pad)
+            got_any = False
+            for i in auto_crop_idxs:
+                sliced = sliced_map.get(i)
+                if sliced is not None:
+                    got_any = True
+                else:
+                    print(f"[MMH3-TemporalExtend] WARNING: segment {i}'s "
+                          "auto-crop slice held no decodable frame - that "
+                          "segment runs without a reference video.")
+                segs[i]["ref_video_frames"] = sliced
+            if ac_pad:
+                print(f"[MMH3-TemporalExtend] ref video: the video ends before "
+                      f"segment(s) {sorted(set(ac_pad))} - their reference "
+                      "video holds its LAST frame for the frames the video "
+                      "cannot reach.")
+            if not got_any:
+                raise ValueError(
+                    "ref-video mode 'auto crop input ref' is connected but the "
+                    "'ref_video_input' video carries no decodable frame at all. "
+                    "Point that socket at a readable video, or switch those "
+                    "segments' ref-video mode to 'load'.")
+            print(f"[MMH3-TemporalExtend] ref video: "
+                  f"{len(auto_crop_idxs)} segment(s) take their reference "
+                  "video by auto-crop (resampled to 24 fps)")
+
         for i in range(resume, len(segs)):
             seg = segs[i]
             ep = _seg_ep(seg)
@@ -2356,16 +3339,34 @@ class MMH3TemporalExtendVideo(io.ComfyNode):
             new_frames = int(seg["new_frames"])
             if i == 0 and merged_v is None:
                 prompt = (base_prompt + "\n" + seg["prompt"]).strip()
+                # the SAME size the loop will ask for below: a 'direct
+                # reference in frame' segment is sampled on its canvas, and
+                # what is encoded here (keyframes above all) has to describe
+                # that latent, not the generation area inside it
+                _pw, _ph = material_stage_size(mat_geo_of.get(i), W, H)
                 pre_cond[i] = _build_first_conditioning(
                     clip, vae, audio_vae,
                     {**seg, "prompt": prompt,
                      "negative": (base_negative + "\n" + seg["negative"]).strip()},
-                    W, H, new_frames, sock_pool=sock_pool, cache=cache)
+                    _pw, _ph, new_frames, sock_pool=sock_pool, cache=cache)
+                # a fresh segment 0 owns chain frames [0, new_frames): its
+                # control slice is the head of the control video either way
+                ctrl_win[i] = control_slice_window(
+                    seg.get("control_mode"), cum_of[i], 0, new_frames)
+                mat_win[i] = material_window(cum_of[i], 0, new_frames)
                 tv = tokens_for_frames(new_frames)
                 continue
             fc = frames_for_tokens(tv)
-            k_split, f_split = snap_split_frame(fc, int(ep.get("tail_frames", 39)))
-            total = (fc - f_split) + new_frames
+            s_tail_replay = int(ep.get("tail_frames", 39))
+            # ONE seam for this segment: the windows below, the bgm slice and
+            # the piece _prepare_continuation builds all come off this triple.
+            # A hard cut is realized as the smallest legal seam, never as a tail
+            # of 0 - see seam_split for why the grid forbids that.
+            k_split, f_split, tail_real = seam_split(fc, s_tail_replay)
+            total = tail_real + new_frames
+            ctrl_win[i] = control_slice_window(
+                seg.get("control_mode"), cum_of[i], tail_real, total)
+            mat_win[i] = material_window(cum_of[i], tail_real, total)
             tv_next = max(tv, k_split + tokens_for_frames(total))
             if i > resume and (seg.get("ref_source") == "prev_frame"
                                or s_seam_ref == "prev_tail"
@@ -2378,17 +3379,22 @@ class MMH3TemporalExtendVideo(io.ComfyNode):
                 tv = tv_next        # built in-loop: needs the accumulated latent
                 continue
             seam_ref = None
-            if s_seam_ref == "prev_tail" and i == resume:
+            if s_seam_ref == "prev_tail" and i == resume and s_tail_replay > 0:
                 # first sampled segment: its merged latent comes from disk /
-                # the latent input, so the seam tail is available right now
+                # the latent input, so the seam tail is available right now.
+                # s_tail_replay <= 0 is the hard cut, where the sampling loop
+                # skips this reference too (no boundary content to pin) - the
+                # k_split of a hard cut sits AT the end of the latent, so
+                # building it here would feed a bogus 2-token tail instead.
                 seam_ref = _build_seam_video_ref(
                     vae, merged_v, k_split, int(ep.get("seam_ref_frames", 0)),
                     prev_audio=merged_a)
+            _pw, _ph = material_stage_size(mat_geo_of.get(i), W, H)
             pre_cond[i] = _build_continue_conditioning(
                 clip, vae, audio_vae,
                 {**seg, "prompt": (base_prompt + "\n" + seg["prompt"]).strip(),
                  "negative": (base_negative + "\n" + seg["negative"]).strip()},
-                W, H, total, (merged_v if i == resume else None), k_split,
+                _pw, _ph, total, (merged_v if i == resume else None), k_split,
                 float(ep.get("anchor_strength", 0.999)), seam_ref=seam_ref,
                 latent_audio_refs=_latent_audio_refs(seg),
                 sock_pool=sock_pool, cache=cache)
@@ -2397,6 +3403,250 @@ class MMH3TemporalExtendVideo(io.ComfyNode):
             print(f"[MMH3-TemporalExtend] pre-encoded conditioning for "
                   f"{len(pre_cond)}/{len(segs) - resume} sampled segment(s) "
                   "(single encoder pass before sampling)")
+
+        # ── fun control (MiniMax H3 Fun ControlNet) ──
+        # The assets are chain-wide (the Tile Editor's 'fun_control_video' plus
+        # the optional inpaint mask / source video); the APPLICATION is
+        # per-segment: each controlled segment gets the slice its piece covers
+        # - starting one carried tail before its own boundary and running for
+        # the piece's whole length (see control_slice_window), so abutting
+        # slices reassemble the control video instead of every segment
+        # restarting at frame 0 the way the native Apply node does.
+        # The patch is a MODEL-SIDE wrapper, so it is orthogonal to every
+        # conditioning the phases above built, to the noise mask (the residual
+        # is multiplied by denoise_mask, so a frozen tail cannot be affected)
+        # and to the stitch that runs after sampling. Nothing is encoded here:
+        # the VAE round-trip happens inside the patch, one segment at a time.
+        ctrl_plan = {}
+        ctrl_segs = [i for i in range(resume, len(segs))
+                     if segs[i].get("control_mode", "off") != "off"]
+        if ctrl_segs:
+            ctrl_list = ", ".join(str(i) for i in ctrl_segs)
+            if controlnet is None:
+                raise ValueError(
+                    f"segment(s) {ctrl_list} have a fun-control mode other than "
+                    "'off', but the 'controlnet' input of this node is not "
+                    "connected. Wire the MiniMax H3 Fun ControlNet model patch "
+                    "(Model Patch Loader) there, or set those segments' "
+                    "fun-control mode back to 'off'.")
+            if not getattr(getattr(controlnet, "model", None),
+                           "injection_layers", None):
+                raise ValueError(
+                    "the object wired to this node's 'controlnet' input is not "
+                    "a MiniMax H3 Fun ControlNet model patch (its model carries "
+                    "no 'injection_layers'). Load the Fun ControlNet "
+                    "checkpoint with a Model Patch Loader node.")
+            bundle = control_image_slots \
+                if isinstance(control_image_slots, dict) else None
+            if not bundle or bundle.get("kind") != CONTROL_BUNDLE_KIND:
+                raise ValueError(
+                    "fun control needs the MMH3 Temporal Tile Editor's "
+                    "'control_image_slots' output wired into this node's "
+                    "'control_image_slots' input - the socket is either not "
+                    "connected or carrying something else (the bundle's 'kind' "
+                    f"is {bundle.get('kind') if bundle else None!r}, expected "
+                    f"{CONTROL_BUNDLE_KIND!r}).")
+            ctrl_video = bundle.get("video")
+            if ctrl_video is None:
+                raise ValueError(
+                    f"segment(s) {ctrl_list} use fun control, but the Tile "
+                    "Editor's 'fun_control_video' input is not connected. "
+                    "Connect a VIDEO source there, or set those segments' "
+                    "fun-control mode back to 'off'.")
+            if _has_fun_control_wrapper(sample_params["model_high"]):
+                print("[MMH3-TemporalExtend] WARNING: the model reaching "
+                      "'sample_params' already carries a MiniMax H3 Fun "
+                      "ControlNet patch - the native 'Apply MiniMax H3 Fun "
+                      "ControlNet' node is also in the graph. Clones of it keep "
+                      "that patch, so control is applied TWICE and the extra "
+                      "copy still uses the control video from frame 0. Wire "
+                      "the model patch into THIS node's 'controlnet' input "
+                      "only.")
+            ctrl_mask_raw = bundle.get("mask")
+            ctrl_src_video = bundle.get("source_video")
+            fps = float(cfg.get("fps") or 24.0)
+            windows = [(i,
+                        ctrl_win[i][0] / fps,
+                        (ctrl_win[i][0] + ctrl_win[i][1]) / fps,
+                        ctrl_win[i][1]) for i in ctrl_segs]
+            vids = _decode_control_windows(ctrl_video, windows)
+            # the source video is only read for INPAINT - a mask is what makes
+            # part of the target "already known"; without one the native node
+            # ignores the source too. Same window as the control video.
+            srcs = _decode_control_windows(ctrl_src_video, windows) \
+                if (ctrl_mask_raw is not None and ctrl_src_video is not None) \
+                else {}
+            # start/end are SIGMA percentages of the model's own table (the
+            # native node's semantics), and one base model means one table
+            # whatever stage runs - so HIGH, LOW and the second pass share it
+            ms = None
+            try:
+                ms = sample_params["model_high"].get_model_object(
+                    "model_sampling")
+            except Exception:
+                ms = None
+            if ms is None:
+                raise ValueError(
+                    "fun control could not read 'model_sampling' from "
+                    "'sample_params.model_high', so the per-segment start/end "
+                    "percentages cannot be turned into sigma values - the "
+                    "model patch would silently stay inactive. Check the "
+                    "'sample_params' wiring.")
+            got_any = False
+            for i in ctrl_segs:
+                a0, n = ctrl_win[i]
+                frames = vids.get(i)
+                if frames is None:
+                    print(f"[MMH3-TemporalExtend] WARNING: segment {i}'s "
+                          f"fun-control window [{a0}, {a0 + n}) starts past the "
+                          "end of 'fun_control_video' - that segment runs "
+                          "WITHOUT control. Use a longer control video, or set "
+                          "its fun-control mode to 'off' to silence this.")
+                    continue
+                s = segs[i]
+                strength = max(0.0, float(s.get("control_strength", 1.0)))
+                if strength <= 0.0:
+                    print(f"[MMH3-TemporalExtend] segment {i}: fun control "
+                          "strength is 0 - skipped (the native patch would be a "
+                          "no-op anyway).")
+                    continue
+                pct0 = float(s.get("control_start", 0.0))
+                pct1 = float(s.get("control_end", 1.0))
+                mask = _slice_control_mask(ctrl_mask_raw, a0, n)
+                got_any = True
+                ctrl_plan[i] = {
+                    "frames": frames,
+                    "mask": mask,
+                    "source": srcs.get(i),
+                    "strength": strength,
+                    "sigma_start": float(ms.percent_to_sigma(pct0)),
+                    "sigma_end": float(ms.percent_to_sigma(pct1)),
+                    "window": (a0, n),
+                    "pct": (pct0, pct1),
+                    "n_frames": int(frames.shape[0]),
+                    "size": (int(frames.shape[2]), int(frames.shape[1])),
+                }
+            if not got_any:
+                raise ValueError(
+                    f"fun control is enabled on segment(s) {ctrl_list} but not "
+                    "one of their windows yielded a frame: 'fun_control_video' "
+                    "ends before they start. Use a control video long enough to "
+                    "cover the chain, or switch those segments' fun-control "
+                    "mode to 'off'.")
+            _sizes = sorted({v["size"] for v in ctrl_plan.values()})
+            _sizes_txt = (f"{_sizes[0][0]}x{_sizes[0][1]}" if len(_sizes) == 1
+                          else f"{len(_sizes)} distinct sizes")
+            _inp = ""
+            if ctrl_mask_raw is not None:
+                _inp = (f", inpaint mask {int(ctrl_mask_raw.shape[0])} frame(s)"
+                        + (", source video connected" if srcs else ""))
+            print(f"[MMH3-TemporalExtend] fun control: {len(ctrl_plan)} of "
+                  f"{len(ctrl_segs)} enabled segment(s) controlled | control "
+                  f"source {_sizes_txt}{_inp} | cfg must stay 1 (H3 rejects "
+                  "batch > 1 and the control encode asserts the target shape)")
+            for i in sorted(ctrl_plan):
+                _c = ctrl_plan[i]
+                print(f"[MMH3-TemporalExtend] fun control segment {i}: "
+                      f"{_c['n_frames']}f [{_c['window'][0]}.."
+                      f"{_c['window'][0] + _c['window'][1] - 1}] on the chain "
+                      f"timeline ({_c['window'][0] / fps:.3f}s.."
+                      f"{(_c['window'][0] + _c['window'][1]) / fps:.3f}s), "
+                      f"strength {_c['strength']}, sigma "
+                      f"[{_c['sigma_end']:.4f}..{_c['sigma_start']:.4f}] "
+                      f"(start {_c['pct'][0]}, end {_c['pct'][1]})"
+                      + (", +mask" if _c["mask"] is not None else "")
+                      + (", +source video" if _c["source"] is not None else ""))
+
+        # ── direct reference in frame: decode each SAMPLED segment's strip
+        #    window and encode it once ──
+        # One decode pass for the whole chain - the windows overlap, exactly
+        # like the fun-control slices (a segment's window opens one carried
+        # tail before its boundary, because the piece re-covers that tail and
+        # its rows are part of the FINISHED video), and each window is as long
+        # as that segment's whole piece so the encoded rows line up with the
+        # piece's rows frame for frame. Encoding up front instead of on demand
+        # (the way the BGM slices are done) is deliberate: a strip latent is
+        # tiny - the strip only, never the whole canvas - and a missing source
+        # should fail BEFORE a long chain starts sampling.
+        mat_plan = {}
+        if mat_segs and mat_geo is not None:
+            if vae is None:
+                raise ValueError(
+                    f"segment(s) {mat_segs} use 'direct reference in frame', "
+                    "but this node has no 'vae': the strip has to be encoded "
+                    "into the latent it is frozen in. Connect the 'vae' input, "
+                    "or set those segments' splice side back to 'off'.")
+            mat_video = cfg.get("ref_video_input")
+            fps_m = float(cfg.get("fps") or 24.0)
+            m_windows = [(i, mat_win[i][0] / fps_m,
+                          (mat_win[i][0] + mat_win[i][1]) / fps_m,
+                          mat_win[i][1]) for i in mat_segs]
+            # pad_last: the window starts where the CHAIN's clock says, so a
+            # reference video too short to fill it must not blank a segment out
+            # - the strip holds the video's LAST frame for the frames it cannot
+            # reach, the whole-window half of the rule _control_frames already
+            # applies where the video ends inside a window. (The fun-control
+            # plan below deliberately asks for the other policy: there, a
+            # control video that ends early leaves its segment uncontrolled,
+            # and says so.)
+            m_pad = []
+            m_frames = _decode_control_windows(mat_video, m_windows,
+                                               pad_last=True, padded=m_pad)
+            if m_pad:
+                print(f"[MMH3-TemporalExtend] direct reference in frame: the "
+                      f"reference video ends before segment(s) "
+                      f"{sorted(set(m_pad))} - their strip holds the video's "
+                      "LAST frame for the frames the video cannot reach.")
+            try:
+                _stream = mat_video.get_stream_source()
+            except Exception:
+                _stream = None
+            # content identity of the strip's source (path + mtime + size); a
+            # BytesIO source has no stable identity, so it is simply never
+            # cached. The geometry rides in `params`: the same window encoded
+            # at a different strip size is a different latent. The free band is
+            # NOT in the key on purpose - it is a mask, not a pixel.
+            m_src = _file_source_id(_stream) if isinstance(_stream, str) else None
+            for i in mat_segs:
+                a0, n, lead = mat_win[i]
+                fr = m_frames.get(i)
+                if fr is None:
+                    # unreachable while the source has ANY decodable frame: a
+                    # window it cannot fill was padded with its last frame
+                    # above (pad_last). This is the "nothing to take a last
+                    # frame FROM" case - do not silently splice an empty strip.
+                    raise ValueError(
+                        f"segment {i} uses 'direct reference in frame', but the "
+                        "reference video wired to the Tile Editor's "
+                        "'ref_video_input' socket yielded no decodable frame at "
+                        "all, so its strip cannot be encoded. Point that socket "
+                        "at a readable video, or set this segment's splice side "
+                        "back to 'off'.")
+                # The window is anchored on the 17-frame group grid, so its
+                # first `lead` frames predate the piece: drop the rows they fill
+                # (see material_window). `lead` is NOT a function of (a0, n) and
+                # therefore BELONGS in the cache key: the same grid-aligned
+                # window can serve two chains whose piece starts at a different
+                # offset inside it. A hard cut used to realize a tail of 0,
+                # which put the piece 5 frames into the window; it now realizes
+                # the smallest legal 5-frame seam, so the piece starts at the
+                # window's own origin - same window (289, 158), `lead` 5 -> 0.
+                # Keyed without it, that entry came back 2 rows short and left
+                # the piece's last rows with an EMPTY strip.
+                _drop = tokens_for_frames(lead)
+                mat_plan[i] = cache.ref(
+                    "mat", m_src,
+                    (mat_geo_of[i]["mat_w"], mat_geo_of[i]["mat_h"], a0, n,
+                     lead),
+                    lambda fr=fr, g=mat_geo_of[i], d=_drop:
+                        _encode_material(vae, fr, g, d))
+            print(f"[MMH3-TemporalExtend] direct reference in frame: spliced on "
+                  f"segment(s) {mat_segs} from frame "
+                  f"{min(mat_win[i][0] for i in mat_segs)} "
+                  f"({min(mat_win[i][0] for i in mat_segs) / fps_m:.3f}s) | "
+                  f"strip {mat_geo['mat_w']}x{mat_geo['mat_h']} at the "
+                  f"{mat_geo['side']}, free band (px) per segment: "
+                  + ", ".join(f"{i}:{mat_recs[i]['expose']}" for i in mat_segs))
 
         # ── background music ('bgm' audio reference mode) ──
         # Every 'bgm' segment gets the slice covering its ABSOLUTE span on the
@@ -2415,10 +3665,22 @@ class MMH3TemporalExtendVideo(io.ComfyNode):
         if any(s.get("ref_audio_mode") == "bgm" for s in segs[resume:]):
             bgm_audio = cfg.get("bgm_audio")
             if bgm_audio is None:
-                raise ValueError(
-                    "audio reference mode 'bgm' reads the song from the "
-                    "'audio_BGM' input of the MMH3 Temporal Tile Editor, which "
-                    "is not connected")
+                # fallback: when the audio_BGM socket is empty AND the wired
+                # ref-video input carries its own audio track, that track
+                # becomes the background music (sliced per segment like any
+                # BGM, so it stays in sync with the auto-cropped video).
+                rv = cfg.get("ref_video_input")
+                _video_bgm = _video_audio_as_bgm(rv) if rv is not None else None
+                if _video_bgm is None:
+                    raise ValueError(
+                        "audio reference mode 'bgm' reads the song from the "
+                        "'audio_BGM' input of the MMH3 Temporal Tile Editor, "
+                        "which is not connected (and the optional ref-video "
+                        "input carries no audio track to fall back on)")
+                bgm_audio = _video_bgm
+                print("[MMH3-TemporalExtend] BGM: 'audio_BGM' not connected - "
+                      "using the ref-video input's own audio track as the "
+                      "background music")
             if audio_vae is None:
                 raise ValueError(
                     "the 'bgm' audio reference mode needs a VAE: the music "
@@ -2487,7 +3749,8 @@ class MMH3TemporalExtendVideo(io.ComfyNode):
             # Legacy per-seg extend_params dicts still override too.
             ep = dict(glob)
             if seg.get("overlap_frames") is not None:
-                ep["tail_frames"] = snap_17n5(int(seg["overlap_frames"]))
+                ep["tail_frames"] = 0 if int(seg["overlap_frames"]) <= 0 \
+                                else snap_17n5(int(seg["overlap_frames"]))
             elif isinstance(seg.get("extend_params"), dict) and seg["extend_params"]:
                 ep.update(seg["extend_params"])
             s_tail = int(ep.get("tail_frames", 39))
@@ -2515,6 +3778,47 @@ class MMH3TemporalExtendVideo(io.ComfyNode):
 
             pre = pre_cond.pop(i, None)   # Phase A conditioning, if hoistable
 
+            # The conditioning describes the latent that is about to be
+            # sampled, and for a 'direct reference in frame' segment that latent
+            # is the SAMPLING CANVAS (generation area + strip): its endpoint
+            # keyframes are frozen ROWS of the packed sequence, so they have to
+            # live on the same grid as the piece. The strip is spliced into the
+            # piece below - never into the conditioning. Phase A above asks the
+            # same question through material_stage_size for the segments it
+            # hoists.
+            _mg = mat_geo_of.get(i)
+            pw, ph = material_stage_size(_mg, W, H)
+
+            # ── 'direct reference in frame': cut the strip at the split ──
+            # The record's second switch (see _material_record). The cut itself
+            # happens INSIDE the HIGH -> LOW handoff (run_two_stage, the one
+            # thing the two stages share is the state handed between them), so
+            # it needs a split to happen at all - and it is refused next to fun
+            # control, which hands the model a canvas-sized tensor of its own
+            # for BOTH stages. Decided here, before the piece is built, so every
+            # consumer below reads one answer.
+            cut_geo = None
+            _frec = mat_recs[i] if i in mat_plan else None
+            if _frec is not None and _frec.get("cut_at_split"):
+                if not sample_params["low_active"]:
+                    print(f"[MMH3-TemporalExtend] segment {i}: 'direct "
+                          "reference in frame' cut at the split needs the LOW "
+                          "stage (SplitSigmas) - with a single schedule the "
+                          "strip stays for the whole of it")
+                elif ctrl_plan.get(i) is not None:
+                    print(f"[MMH3-TemporalExtend] segment {i}: 'direct "
+                          "reference in frame' cut at the split cannot share a "
+                          "segment with fun control (the control latent is "
+                          "encoded at the canvas size, for every stage of the "
+                          "segment) - the strip stays for the whole schedule")
+                else:
+                    cut_geo = mat_geo_of[i]
+                    print(f"[MMH3-TemporalExtend] segment {i}: 'direct "
+                          f"reference in frame' will cut the {cut_geo['mat_w']}x"
+                          f"{cut_geo['mat_h']} strip at the split - the "
+                          f"{cut_geo['gen_w']}x{cut_geo['gen_h']} generation "
+                          "area alone is what the detail stage samples")
+
             if i == 0 and merged_v is None:
                 # ── fresh generation ──
                 frames = int(seg["new_frames"])           # 17n + 5
@@ -2524,7 +3828,7 @@ class MMH3TemporalExtendVideo(io.ComfyNode):
                     pos, neg = _build_first_conditioning(
                         clip, vae, audio_vae, {**seg, "prompt": prompt,
                                     "negative": (base_negative + "\n" + seg["negative"]).strip()},
-                        W, H, frames, sock_pool=sock_pool, cache=cache)
+                        pw, ph, frames, sock_pool=sock_pool, cache=cache)
                 piece, frame_count = _empty_piece(W, H, frames)
                 if seg_bgm:
                     # a fresh segment starts at the chain's origin, so its
@@ -2534,9 +3838,18 @@ class MMH3TemporalExtendVideo(io.ComfyNode):
                         0, piece["samples"].tensors[1].shape[-1])
                     if bgm_slice is not None:
                         _freeze_bgm_fresh(piece, bgm_slice)
+                # direct reference in frame: a fresh segment covers chain
+                # frames [0, frames), which is exactly its window - splice the
+                # strip after the BGM mask so the strip's zeros compose with
+                # it. This grows the piece onto this segment's sampling canvas;
+                # everything past this point runs at canvas size and is cut
+                # back down once the sampler is done.
+                if i in mat_plan:
+                    piece = _splice_material(piece, mat_geo_of[i], mat_plan[i])
                 print(f"[MMH3-TemporalExtend] segment 0: fresh {frames} frames "
                       f"({seg.get('mode')}, seed {seed}"
-                      f"{', BGM soundtrack' if seg_bgm else ''})")
+                      f"{', BGM soundtrack' if seg_bgm else ''}"
+                      f"{', direct reference in frame' if i in mat_plan else ''})")
             else:
                 # ── continuation: split the accumulated tail ──
                 new_frames = int(seg["new_frames"])       # multiple of 17
@@ -2549,12 +3862,17 @@ class MMH3TemporalExtendVideo(io.ComfyNode):
                     # the slice spans exactly what the new piece's audio covers:
                     # from this segment's split point (absolute frame f_split)
                     # through the piece's end (absolute frame total) - the same
-                    # integers _prepare_continuation recomputes internally
+                    # integers _prepare_continuation recomputes internally, off
+                    # the same helper. A hard cut's realized seam is the
+                    # smallest legal one (seam_split), so the music is framed
+                    # from THERE; starting it at the literal boundary instead
+                    # would frame it a few frames late and short, i.e. desynced
+                    # from the picture.
                     _fc = frames_for_tokens(merged_v.shape[2])
-                    _k, _f = snap_split_frame(_fc, s_tail)
+                    _k, _f, _t = seam_split(_fc, s_tail)
                     bgm_slice = _bgm_slice(
                         round(_f * FRAME_RESCALE),
-                        round(((_fc - _f) + new_frames) * FRAME_RESCALE))
+                        round((_t + new_frames) * FRAME_RESCALE))
                 piece, (k_split, f_split, tail_real, total, frozen_v,
                         frozen_a) = _prepare_continuation(
                     merged_v, merged_a, s_tail, new_frames,
@@ -2562,7 +3880,27 @@ class MMH3TemporalExtendVideo(io.ComfyNode):
                     fade_impl=s_fade_impl, init_content_weight=s_init_cw,
                     max_mask_strength=s_max_msk,
                     bgm_slice=bgm_slice)
+                # direct reference in frame: the piece covers chain frames
+                # [cum - tail_real, cum - tail_real + total) = its window, so
+                # the strip lands on the very rows the finished video plays.
+                # That includes the carried tail: those rows are frozen this
+                # run, but they are still rendered - and when the PREVIOUS
+                # segment did not use the mode, they are the first frames of
+                # the strip, which is exactly why they are spliced over too.
+                # The carried latent itself is the generation area (the strip
+                # never survives a segment), so this is where the piece grows
+                # onto the canvas; _crop_canvas undoes it after sampling.
+                if i in mat_plan:
+                    piece = _splice_material(piece, mat_geo_of[i], mat_plan[i])
                 frame_count = total
+                # overlap_frames <= 0 = HARD CUT: the seam is meant to be
+                # abrupt, so the seam anchor / 'prev_tail' seam reference stay
+                # OFF - they would pin the very boundary the user asked to
+                # break. Keyed on the REQUESTED tail, never on `tail_real`: the
+                # realized seam is the smallest legal one (5 frames) and so is
+                # never 0 (see seam_split), while these two guards must keep
+                # agreeing with the pre-scan's `s_tail_replay > 0` test.
+                hard_cut = int(s_tail) <= 0
                 la_refs = _latent_audio_refs(seg, f_split)
                 # anchor for the NEXT segment's 'previous audio' reference:
                 # this segment's rendition starts at its split point on the
@@ -2574,7 +3912,7 @@ class MMH3TemporalExtendVideo(io.ComfyNode):
                     ptxt = (base_prompt + "\n" + seg["prompt"]).strip()
                     ntxt = (base_negative + "\n" + seg["negative"]).strip()
                     seam_ref = None
-                    if s_seam_ref == "prev_tail":
+                    if s_seam_ref == "prev_tail" and not hard_cut:
                         if vae is None:
                             print("[MMH3-TemporalExtend] WARNING: "
                                   "seam_reference='prev_tail' needs a VAE - ignored")
@@ -2584,21 +3922,104 @@ class MMH3TemporalExtendVideo(io.ComfyNode):
                                 prev_audio=merged_a)
                     pos, neg = _build_continue_conditioning(
                         clip, vae, audio_vae, {**seg, "prompt": ptxt, "negative": ntxt},
-                        W, H, frame_count, merged_v, k_split, s_anchor_strength,
+                        pw, ph, frame_count, merged_v, k_split, s_anchor_strength,
                         seam_ref=seam_ref, latent_audio_refs=la_refs,
                         sock_pool=sock_pool, cache=cache)
                 if s_kf_mode == "drop":
                     pos, neg = strip_keyframes(pos), strip_keyframes(neg)
-                if s_anchor_seam:
-                    pos = anchor_conditioning(pos, merged_v, k_split,
-                                              s_anchor_strength)
+                if s_anchor_seam and not hard_cut:
+                    # The anchor keyframe replaces frame 0 with the carried
+                    # content - on the SAMPLING CANVAS, because keyframes are
+                    # frozen rows of the target's own grid. With a strip spliced
+                    # in, that content is the piece's first row (the carried
+                    # frame at the generation area PLUS the strip the freeze
+                    # just wrote into it); without one it is simply the carried
+                    # frame the old way. `merged_v` is the generation area in
+                    # both cases, so it can no longer stand in for a canvas.
+                    if i in mat_plan:
+                        pos = anchor_conditioning(pos, piece["samples"].tensors[0],
+                                                  0, s_anchor_strength)
+                    else:
+                        pos = anchor_conditioning(pos, merged_v, k_split,
+                                                  s_anchor_strength)
                 info.update({"split_frame": f_split, "tail_frames": tail_real,
                              "total_frames": total})
                 print(f"[MMH3-TemporalExtend] segment {i}: split at frame "
                       f"{f_split} (token {k_split}) | tail {tail_real} f | "
                       f"+{new_frames} f -> {total} f (seed {seed})")
 
-            seg_samples = run_two_stage(piece, pos, neg, seed, f"segment {i}:")
+            if i in mat_plan:
+                # this segment's OWN geometry (same _mg the conditioning above
+                # was sized with): the free band is per segment
+                info["material"] = {
+                    "mode": "direct reference in frame",
+                    "side": _mg["side"],
+                    # the resolved answer, not the request: 'cut at the split'
+                    # is printed as left off when the segment has no split or
+                    # shares the segment with fun control
+                    "cut_at_split": cut_geo is not None,
+                    # the encode window, and the `lead` frames of it that
+                    # predate the piece and are therefore dropped from the
+                    # encode (0 unless this segment is a hard cut)
+                    "window": list(mat_win[i][:2]),
+                    "window_lead": int(mat_win[i][2]),
+                    "strip": [_mg["mat_w"], _mg["mat_h"]],
+                    "expose_px": _mg["band"] * 16,
+                    "cell": "row" if _mg["vertical"] else "col",
+                    "frozen": list(_mg["frozen"]),
+                    "free": list(_mg["free"]),
+                }
+
+            # ── fun control: this segment's patch instance + model clones ──
+            # ONE instance per segment, shared by the HIGH/LOW stages AND the
+            # second pass: its control latent is cached BY SHAPE, so all four
+            # stages of one segment (same target shape) cost a single VAE
+            # round-trip, while a FRESH instance next segment keeps their
+            # windows apart (a shared one would hand the previous segment's
+            # control latent to the next - the cache compares shapes only).
+            # A second pass without control would re-render the controlled
+            # content freely, so it is mounted there too - a refinement is
+            # not SUPPOSED to run under a hint, but nothing here refuses a
+            # segment that carries one (see the 2nd pass block: the strip
+            # is cut all the same and the hint is re-fitted to the
+            # generation area).
+            seg_patch = None
+            sp_seg = sample_params
+            sp2_seg = second_sample_params
+            _ctrl = ctrl_plan.get(i)
+            if _ctrl is not None:
+                # function-level import: comfy_extras private machinery, only
+                # needed on a controlled run (house style here)
+                from comfy_extras.nodes_minimax_h3 import (
+                    MiniMaxH3FunControlPatch)
+                _csrc = _ctrl.get("source")
+                seg_patch = MiniMaxH3FunControlPatch(
+                    controlnet, vae,
+                    _ctrl["frames"][..., :3].movedim(-1, 1),
+                    _ctrl["mask"],
+                    (_csrc[..., :3].movedim(-1, 1)
+                     if (_ctrl["mask"] is not None and _csrc is not None)
+                     else None),
+                    _ctrl["strength"], _ctrl["sigma_start"],
+                    _ctrl["sigma_end"])
+                sp_seg = _mount_control(sample_params, seg_patch)
+                if second_sample_params is not None:
+                    sp2_seg = _mount_control(second_sample_params, seg_patch)
+                print(f"[MMH3-TemporalExtend] segment {i}: fun control mounted "
+                      f"(slice {_ctrl['n_frames']}f from frame "
+                      f"{_ctrl['window'][0]}, strength {_ctrl['strength']})")
+                info["fun_control"] = {
+                    "window": list(_ctrl["window"]),
+                    "frames": _ctrl["n_frames"],
+                    "strength": _ctrl["strength"],
+                    "sigma_start": _ctrl["sigma_start"],
+                    "sigma_end": _ctrl["sigma_end"],
+                    "mask": _ctrl["mask"] is not None,
+                    "source_video": _ctrl["source"] is not None,
+                }
+
+            seg_samples = run_two_stage(piece, pos, neg, seed, f"segment {i}:",
+                                        params=sp_seg, cut=cut_geo)
             seg_v, seg_a = seg_samples.tensors[0], seg_samples.tensors[1]
             # discard the stashed qsample_init band coordinates (kept only for
             # the removed brightness-match feature; popped to keep the piece
@@ -2615,23 +4036,51 @@ class MMH3TemporalExtendVideo(io.ComfyNode):
             # 'bgm' mode the audio keeps its all-zero mask so the frozen music
             # is not re-developed (see the seg_bgm branch below).
             if second_sample_params is not None and i > 0:
+                # ── 'direct reference in frame' never reaches this pass ──
+                # The strip steered the FIRST pass; this one re-denoises the
+                # whole segment from the prompt alone, so the strip is CUT OUT
+                # of the latent as the pass begins. Re-pinning it instead would
+                # let the refinement keep reading the reference, and handing the
+                # canvas-sized mask to the smaller latent would clamp every row
+                # of it to 0 and freeze the whole pass into a silent no-op.
+                # `_is_canvas` is the test: with 'cut at the split' the strip is
+                # already gone and this is a no-op. NO exception for fun control
+                # either: in principle a refinement does not run under a control
+                # hint at all, so the strip goes whatever else the segment
+                # carries. A segment that insists is not refused (see the mount
+                # above) - it keeps its control, whose hint is simply re-fitted
+                # to the generation area: prepare_control_latent caches BY
+                # SHAPE, so the new shape costs one VAE round-trip and nothing
+                # else.
+                _mg2 = mat_geo_of.get(i)
+                _v2 = seg_v
+                if _mg2 is not None and _is_canvas(seg_v, _mg2):
+                    _v2 = _crop_canvas(seg_v, _mg2)
+                    print(f"[MMH3-TemporalExtend] segment {i} 2nd pass: "
+                          "'direct reference in frame' strip cut before the "
+                          f"refinement pass - the {_mg2['gen_w']}x"
+                          f"{_mg2['gen_h']} generation area alone is what it "
+                          "re-denoises")
                 piece2 = {"samples": comfy.nested_tensor.NestedTensor(
-                    (seg_v, seg_a))}
+                    (_v2, seg_a))}
                 if seg_bgm:
                     # 'bgm' mode: pin the second pass's audio to the same
                     # frozen BGM slice the first pass used - the audio mask is
                     # all zero, so the music is never re-developed. The video
-                    # mask stays all ones (the whole video re-samples, exactly
-                    # as in the unmasked second pass).
+                    # mask is all ones over the latent handed over (the whole
+                    # video re-samples, exactly as in the unmasked second pass
+                    # above), which is also why it follows the CUT shape: a
+                    # canvas-shaped mask would clamp every row of a smaller
+                    # latent to 0.
                     piece2["noise_mask"] = comfy.nested_tensor.NestedTensor(
-                        (torch.ones((1, 1, seg_v.shape[2], seg_v.shape[3],
-                                     seg_v.shape[4]), dtype=torch.float32),
+                        (torch.ones((1, 1, _v2.shape[2], _v2.shape[3],
+                                     _v2.shape[4]), dtype=torch.float32),
                          torch.zeros((1, 1, 1, seg_a.shape[-1]),
                                      dtype=torch.float32)))
                 seg2 = run_two_stage(piece2, strip_keyframes(pos),
                                      strip_keyframes(neg), seed,
                                      f"segment {i} 2nd pass:",
-                                     params=second_sample_params)
+                                     params=sp2_seg)
                 seg_v2, seg_a2 = seg2.tensors[0], seg2.tensors[1]
                 seg_v = seg_v2
                 if second_pass_audio == "second" and not seg_bgm:
@@ -2639,6 +4088,25 @@ class MMH3TemporalExtendVideo(io.ComfyNode):
                 print(f"[MMH3-TemporalExtend] segment {i}: 2nd pass applied "
                       f"(stitched audio: "
                       f"{'BGM - frozen by mask' if seg_bgm else second_pass_audio + ' sample'})")
+
+            # fun control: release this segment's control latent / streams.
+            # The wrapper stays registered on the CLONES created above (they
+            # are discarded with the loop iteration), and the control network's
+            # weights live in the shared model patch, so this costs nothing
+            # but the cached latent - which must not survive into the next
+            # segment. Nothing to do without a control patch.
+            if seg_patch is not None:
+                seg_patch.cleanup()
+
+            if i in mat_plan:
+                # ── the strip dies here ──
+                # It existed only to steer THIS segment's sampling, so the
+                # canvas is cut back to the generation area before anything
+                # else looks at the result: the temporal blend below, the
+                # stored attempts, the previews and whatever the next segment
+                # inherits are the generated picture alone - no material ever
+                # reaches the chain or the outputs.
+                seg_v = _crop_canvas(seg_v, mat_geo_of[i])
 
             if i == 0 and merged_v is None:
                 merged_v, merged_a = seg_v, seg_a
@@ -2684,6 +4152,30 @@ class MMH3TemporalExtendVideo(io.ComfyNode):
                         if sample_params["low_active"] else None),
         }
         seg_info["sampling"] = sampling
+        seg_info["fun_control"] = {
+            "enabled": bool(ctrl_segs),
+            "segments": sorted(ctrl_plan),
+            "inpaint_mask": bool(ctrl_plan and any(
+                c["mask"] is not None for c in ctrl_plan.values())),
+        } if ctrl_segs else {"enabled": False}
+        seg_info["material"] = {
+            "enabled": bool(mat_geo is not None),
+            "mode": "direct reference in frame",
+            # the strip is a SAMPLING SCAFFOLD: it is spliced onto each sampled
+            # segment's canvas and cut off again before that segment is
+            # stitched, stored or handed on, so every latent of the chain - and
+            # every output - is the generation area below. Nothing has to agree
+            # between segments any more: the side, the strip's size and the free
+            # band are all per segment.
+            "segments": mat_segs,
+            "sides": {i: mat_geo_of[i]["side"] for i in mat_segs},
+            "expose_px": {i: mat_recs[i]["expose"] for i in mat_segs},
+            "strip": {i: [mat_geo_of[i]["mat_w"], mat_geo_of[i]["mat_h"]]
+                      for i in mat_segs},
+            "canvas": {i: [mat_geo_of[i]["total_w"], mat_geo_of[i]["total_h"]]
+                       for i in mat_segs},
+            "generation_area": [W, H],
+        }
         seg_info["cache"] = {"dir": os.path.join(_temporal_root(
             cfg.get("storage", "temp")), CACHE_DIRNAME), **cache.stats}
         print(f"[MMH3-TemporalExtend] reference cache: {cache.summary()}")
@@ -2723,6 +4215,269 @@ def _freeze_bgm_fresh(piece, bgm_slice):
         (torch.ones((1, 1, v.shape[2], v.shape[3], v.shape[4]),
                     dtype=torch.float32),
          prof_a.view(1, 1, 1, a.shape[-1])))
+
+
+def _material_mask(geo, hl, wl, device=None):
+    """The strip's video noise-mask: 0 over the strip minus the expose band, 1
+    everywhere else - broadcastable against [1, 1, tv, hl, wl] by minimum().
+
+    Shaped [1,1,1,hl,1] (top/bottom strip) or [1,1,1,1,wl] (left/right), i.e.
+    ROW- or COLUMN-wise rather than a full 5-D mask: the strip is frozen on
+    EVERY latent row - the overlap rows are frozen, but the finished video
+    still PLAYS them, so they have to show the strip too - while the
+    generation area keeps whatever the tail mode's profile says. Inside the
+    free band the value is 1, so the row's own profile is what applies there
+    (see _freeze_material)."""
+    if geo["vertical"]:
+        m = torch.ones((1, 1, 1, int(hl), 1), dtype=torch.float32,
+                       device=device)
+        m[:, :, :, geo["frozen"][0]:geo["frozen"][1], :] = 0.0
+    else:
+        m = torch.ones((1, 1, 1, 1, int(wl)), dtype=torch.float32,
+                       device=device)
+        m[:, :, :, :, geo["frozen"][0]:geo["frozen"][1]] = 0.0
+    return m
+
+
+def _encode_material(vae, frames_img, geo, drop=0):
+    """VAE-encode the decoded strip frames at the strip's canvas size.
+
+    Centre-crop lanczos resize, the same call the reference pipeline uses; the
+    geometry already matched the source's aspect ratio, so the crop only
+    absorbs the sub-32 px rounding. Returns [1, 24, T, h/16, w/16] on the
+    strip's own axes (h/16 = the full canvas height for a left/right strip).
+
+    `drop` throws away the encode's first rows. The window opens on the
+    17-frame group boundary at or below the piece's first frame (see
+    material_window), so those rows cover frames that predate the piece, and
+    dropping them is exactly what makes the strip's row 0 the piece's row 0.
+    A video VAE only yields rows for whole 17-frame groups, which is the other
+    half of the same constraint: a window that is not ``5 (mod 17)`` frames
+    long comes back short (``video_latent_t`` floors it), i.e. with fewer rows
+    than the piece it has to fill."""
+    from comfy_extras.nodes_minimax_h3 import _resize
+    resized = _resize(frames_img, geo["mat_w"], geo["mat_h"], "center")
+    z = vae.encode(resized)
+    return z[:, :, drop:].contiguous() if drop else z
+
+
+def _gen_offset(geo):
+    """First latent cell of the GENERATION AREA inside the sampling canvas.
+
+    The strip takes one end of the spliced axis ('left' / 'top' by `before`),
+    so the generation area either starts after it or at 0."""
+    return int(geo["mat_lat"]) if geo["before"] else 0
+
+
+def _expand_canvas(piece, geo):
+    """Grow a generation-area piece onto this segment's sampling canvas.
+
+    The strip is only ever laid out for ONE segment's sampling (see
+    _splice_material), so the piece - and its video noise-mask - have to be
+    placed on the canvas the DiT is about to see. The generation area keeps
+    every value it had, its frame axis is untouched (only the strip's cells are
+    appended along one spatial axis) and the strip region starts as ordinary
+    canvas with mask 1: _freeze_material then writes the reference into it and
+    pins it. The audio stream is not spatial, so it rides through unchanged."""
+    v, a = piece["samples"].tensors[0], piece["samples"].tensors[1]
+    off = _gen_offset(geo)
+    tv, gh, gw = int(v.shape[2]), int(v.shape[3]), int(v.shape[4])
+    ch, cw = int(geo["total_h"]) // 16, int(geo["total_w"]) // 16
+    if (gh, gw) == (ch, cw):
+        return piece                       # already the canvas (nothing to do)
+    if (gh, gw) != (int(geo["gen_h"]) // 16, int(geo["gen_w"]) // 16):
+        raise ValueError(
+            "'direct reference in frame': the piece is "
+            f"{gw * 16}x{gh * 16} but this segment's generation area is "
+            f"{geo['gen_w']}x{geo['gen_h']} - the strip cannot be laid out")
+    vc = torch.zeros((1, v.shape[1], tv, ch, cw),
+                     device=v.device, dtype=v.dtype)
+    if geo["vertical"]:
+        vc[:, :, :, off:off + gh, :] = v
+    else:
+        vc[:, :, :, :, off:off + gw] = v
+    out = dict(piece)
+    out["samples"] = comfy.nested_tensor.NestedTensor((vc, a))
+    base = piece.get("noise_mask")
+    if base is not None:
+        # 1 everywhere on the strip side; _freeze_material's minimum() then
+        # zeroes the strip's own cells (the free band keeps whatever profile
+        # the tail mode gave it - exactly as it did when the canvas was built
+        # by _prepare_continuation / _freeze_bgm_fresh)
+        bv, ba = base.tensors[0], base.tensors[1]
+        mc = torch.ones((1, 1, tv, ch, cw), device=bv.device, dtype=bv.dtype)
+        bv = bv.expand(1, 1, tv, gh, gw)
+        if geo["vertical"]:
+            mc[:, :, :, off:off + gh, :] = bv
+        else:
+            mc[:, :, :, :, off:off + gw] = bv
+        out["noise_mask"] = comfy.nested_tensor.NestedTensor((mc, ba))
+    return out
+
+
+def _crop_canvas(v, geo):
+    """Cut the strip back off a sampled canvas latent -> the generation area.
+
+    The other half of _splice_material, and the reason the rest of the chain
+    never hears about the strip: the reference only ever existed to steer THIS
+    segment's sampling, so the moment the sampler is done the canvas loses the
+    strip's cells and the segment continues as an ordinary generation-area
+    latent - blended with the previous one, stored as an attempt, previewed and
+    handed to the next segment as such."""
+    off = _gen_offset(geo)
+    gh, gw = int(geo["gen_h"]) // 16, int(geo["gen_w"]) // 16
+    if int(v.shape[3]) == gh and int(v.shape[4]) == gw:
+        return v                           # not a canvas (nothing to cut)
+    if geo["vertical"]:
+        return v[:, :, :, off:off + gh, :].contiguous()
+    return v[:, :, :, :, off:off + gw].contiguous()
+
+
+def _splice_material(piece, geo, mat_lat):
+    """Grow a piece onto the sampling canvas and splice the strip in: what a
+    'direct reference in frame' segment hands to the sampler (the strip's own
+    semantics - freeze, free band, overwrite every row - are _freeze_material's,
+    see there)."""
+    return _freeze_material(_expand_canvas(piece, geo), geo, mat_lat)
+
+
+def _is_canvas(v, geo):
+    """True while `v` still carries this segment's strip.
+
+    The cut is not recorded anywhere - it is visible in the latent, and that is
+    what the callers that only ever see the latent have to test (the second
+    pass's strip pinning: a strip that was cut at the split is simply not
+    there)."""
+    return (int(v.shape[3]) == int(geo["total_h"]) // 16
+            and int(v.shape[4]) == int(geo["total_w"]) // 16)
+
+
+def _cut_keyframes(cond, geo):
+    """Crop every keyframe latent of ONE conditioning list to the generation
+    area (the `conds` half of material_cut)."""
+    out = []
+    for tensor, d in cond:
+        kfs = d.get("minimax_keyframes") if isinstance(d, dict) else None
+        if not kfs:
+            out.append([tensor, d])
+            continue
+        nd = dict(d)
+        nd["minimax_keyframes"] = [
+            ({**kf, "latent": _crop_canvas(kf["latent"], geo)}
+             if kf.get("latent") is not None else kf) for kf in kfs]
+        out.append([tensor, nd])
+    return out
+
+
+def material_cut(geo, samples, mask=None, conds=()):
+    """Cut ONE stage's canvas-shaped bundle down to the generation area.
+
+    The "cut at the split" half of 'direct reference in frame': the strip
+    steers the HIGH stage, and the detail (LOW) stage then continues from the
+    SAME state with the reference GONE - the structure is already in the latent
+    by then, so the detail stage is finished from the prompt alone. That is a
+    size change of the latent the DiT is about to see, and everything the model
+    packs for one stage has to agree on that size, so the whole bundle goes with
+    it:
+
+    * the video latent (the HIGH stage's x0 prediction) - `_crop_canvas`, whose
+      frozen zones hold pristine content, so the carried tail survives exactly;
+    * the video noise-mask: the strip's cells were frozen only because the strip
+      was there, so what is left is the generation area's own profile (the
+      carried tail keeps its own zeros, and the strip's free band dies with the
+      strip it was blending into);
+    * every ``minimax_keyframes`` latent in `conds`. A keyframe is a frozen
+      frame of the TARGET's own grid - ``PackedLayout`` reserves
+      ``latent_t * frame_rows(target)`` rows for it - so a canvas-sized
+      keyframe against a generation-area target is a row-count mismatch, not a
+      stale picture. ``minimax_refs`` blocks are deliberately left alone: each
+      carries its own grid and is packed independently of the target.
+
+    Neither the audio stream (not spatial) nor anything already at generation
+    area size is touched - `_crop_canvas` is idempotent, so a second call is a
+    no-op. Returns ``(samples, mask, conds)`` (the mask is None when there was
+    none)."""
+    out_samples = comfy.nested_tensor.NestedTensor(
+        (_crop_canvas(samples.tensors[0], geo), samples.tensors[1]))
+    out_mask = mask
+    if mask is not None:
+        out_mask = comfy.nested_tensor.NestedTensor(
+            (_crop_canvas(mask.tensors[0], geo), mask.tensors[1]))
+    return out_samples, out_mask, [_cut_keyframes(c, geo) for c in conds]
+
+
+def _freeze_material(piece, geo, mat_lat):
+    """Splice the encoded strip of a 'direct reference in frame' segment into
+    its piece and pin it. Expects the CANVAS-sized piece _expand_canvas built,
+    and returns it - the caller hands the result straight to the sampler.
+
+    `geo` is THIS segment's geometry (its free band is per segment - the seam
+    that band has to blend is the seam of this piece). `mat_lat` has the
+    PIECE's time axis: row r is local frame r, which material_window +
+    _encode_material guarantee (the encode window sits on the 17-frame group
+    grid and its leading rows are dropped, so the strip's row 0 IS this
+    piece's row 0). It is written into EVERY row:
+    the carried tail's own copy is the previous segment's rendition of the same
+    frames, and overwriting it with the fresh encode keeps the strip
+    pixel-exact across the seam. When the PREVIOUS segment did not use the
+    mode, those carried rows are the first frames of the strip in the finished
+    video - which is exactly why the overwrite is unconditional: a locked
+    prefix, or a segment that did not use the mode, cannot leave a stale (or
+    generated) strip behind.
+
+    The mask is minimum(existing, strip mask), so the strip STAYS frozen
+    whatever max_mask_strength did to the profile: its 'lift the whole
+    profile' scaling is exactly what would thaw the strip (the same reason
+    qsample_init transforms its fade band only)."""
+    v, a = piece["samples"].tensors[0], piece["samples"].tensors[1]
+    tv, hl, wl = int(v.shape[2]), int(v.shape[3]), int(v.shape[4])
+    vertical = geo["vertical"]
+    axis = hl if vertical else wl
+    lo = int(geo["lo"])
+    # never trust the encoder's row count: a source shorter than the window is
+    # clamped (held) rather than stretched, and the strip is one canvas axis.
+    # The strip's OWN extent on that axis is geo["mat_lat"] cells - NOT
+    # `axis - lo`, which for a left/top strip spans the whole canvas (canvas =
+    # strip + generation area) and so reports the generation area itself as a
+    # missing half of the strip.
+    strip_cells = min(int(geo["mat_lat"]), axis - lo)
+    n_t = min(int(mat_lat.shape[2]), tv)
+    n_s = min(int(mat_lat.shape[3] if vertical else mat_lat.shape[4]),
+              strip_cells)
+    if n_t <= 0 or n_s <= 0:
+        print("[MMH3-TemporalExtend] WARNING: 'direct reference in frame' "
+              f"encode came back empty ({tuple(mat_lat.shape)}) - nothing "
+              "spliced")
+        return piece
+    if n_t < tv or n_s < strip_cells:
+        print(f"[MMH3-TemporalExtend] WARNING: 'direct reference in frame' "
+              f"covers {n_t}/{tv} rows, {n_s}/{strip_cells} cells of the strip "
+              "- what it misses is NOT the reference: a row it misses keeps an "
+              "EMPTY strip there, a cell it misses is generated freely")
+    src = mat_lat[:, :, :n_t].to(device=v.device, dtype=v.dtype)
+    # BOTH sides are clamped to the rows the encode actually delivered - the
+    # same treatment n_s already gives the spatial axis. Normally n_t == tv
+    # (the window is on the 17-frame grid and the lead rows are dropped in
+    # _encode_material, see material_window); an encode that is genuinely
+    # shorter - a reference video ending inside the window - then degrades to
+    # 'the missing rows are generated freely', exactly what the warning above
+    # promises, instead of failing the whole run on the broadcast.
+    if vertical:
+        v[:, :, :n_t, lo:lo + n_s, :] = src[:, :, :, :n_s]
+    else:
+        v[:, :, :n_t, :, lo:lo + n_s] = src[:, :, :, :, :n_s]
+    base = piece.get("noise_mask")
+    mask = _material_mask(geo, hl, wl,
+                          device=(base.tensors[0].device if base is not None
+                                  else v.device))
+    if base is not None:
+        mv, ma = torch.minimum(base.tensors[0], mask), base.tensors[1]
+    else:
+        mv = mask
+        ma = torch.ones((1, 1, 1, int(a.shape[-1])), dtype=torch.float32,
+                        device=mv.device)
+    piece["noise_mask"] = comfy.nested_tensor.NestedTensor((mv, ma))
+    return piece
 
 
 class _InitBiasNoise:
@@ -2800,9 +4555,21 @@ def _prepare_continuation(video, audio, tail_frames, new_frames,
     device, dtype = video.device, video.dtype
     frame_count = frames_for_tokens(tv)
 
-    k_split, f_split = snap_split_frame(frame_count, tail_frames)
-    tail_real = frame_count - f_split
+    # The seam is ALWAYS on the token-group grid, hard cut included - one
+    # helper, shared with the windows the pre-scan sizes and the bgm slice (see
+    # seam_split). A tail of 0 is not realizable and is forwarded as the
+    # smallest legal seam instead.
+    k_split, f_split, tail_real = seam_split(frame_count, tail_frames)
     total = tail_real + new_frames
+    if int(tail_frames) <= 0:
+        # overlap_frames <= 0 = HARD CUT: no fade may run across a boundary the
+        # user asked to be abrupt, so fade_frames is forced to 0 and the few
+        # frames seam_split realizes stay FROZEN (mask 0) - a byte-exact
+        # re-stitch of content the finished video already showed. That is why
+        # the picture boundary still lands exactly at `f_split` and nothing at
+        # the seam is visible: what the hard cut changes is the FADE, not the
+        # boundary.
+        fade_frames = 0
     tv_tail = tv - k_split
     a_src0, a_src1 = audio_range(f_split, frame_count)
     a_src1 = min(a_src1, ta)
